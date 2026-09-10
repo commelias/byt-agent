@@ -34,6 +34,14 @@ async def health(_: Request):
     return PlainTextResponse("ok")
 
 
+async def diag(request: Request):
+    """Диагностика связи с Telegram; закрыта тем же MCP_TOKEN: /diag?token=..."""
+    from app import telegram
+    if not config.MCP_TOKEN or request.query_params.get("token") != config.MCP_TOKEN:
+        return PlainTextResponse("unauthorized", status_code=401)
+    return PlainTextResponse(await telegram.diagnose())
+
+
 @contextlib.asynccontextmanager
 async def lifespan(app: Starlette):
     db.init()
@@ -47,6 +55,7 @@ app = Starlette(
     routes=[
         Route("/", health),
         Route("/health", health),
+        Route("/diag", diag),
         Mount("/", app=mcp.streamable_http_app()),
     ],
     middleware=[Middleware(BearerAuth)],
