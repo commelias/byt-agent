@@ -2,11 +2,13 @@
 from datetime import date, timedelta
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 from . import config, db, orthodox
 
 mcp = FastMCP(
     "byt-journal",
+transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
     instructions=(
         "Журнал быта одного человека: питание, тренировки, православный календарь, настройки. "
         "Записывай каждый приём пищи и тренировку сразу, как только посчитал. "
