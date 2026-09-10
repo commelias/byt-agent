@@ -33,9 +33,9 @@ def _totals_line(t: dict, s: dict) -> str:
 # ---------- питание ----------
 
 @mcp.tool()
-def log_meal(description: str, kcal: float, grams: float | None = None,
-             protein: float | None = None, fat: float | None = None, carbs: float | None = None,
-             day: str | None = None) -> str:
+def log_meal(description: str, kcal: float, grams: float = 0,
+             protein: float = 0, fat: float = 0, carbs: float = 0,
+             day: str = "") -> str:
     """Записать приём пищи в дневник. description — блюдо и состав, kcal — калории,
     grams — вес порции, protein/fat/carbs — БЖУ в граммах. day — дата YYYY-MM-DD, по умолчанию сегодня.
     Возвращает итог за день."""
@@ -44,7 +44,7 @@ def log_meal(description: str, kcal: float, grams: float | None = None,
 
 
 @mcp.tool()
-def day_summary(day: str | None = None) -> str:
+def day_summary(day: str = "") -> str:
     """Итог питания за день: список приёмов пищи и суммы калорий и БЖУ против норм.
     day — дата YYYY-MM-DD, по умолчанию сегодня."""
     meals = db.meals_for_day(day)
@@ -56,7 +56,7 @@ def day_summary(day: str | None = None) -> str:
 
 
 @mcp.tool()
-def undo_last_meal(day: str | None = None) -> str:
+def undo_last_meal(day: str = "") -> str:
     """Удалить последнюю запись о еде за день (если ошиблись или записали дважды)."""
     removed = db.delete_last_meal(day)
     return f"Удалено: {removed}" if removed else "Удалять нечего — записей за день нет."
@@ -75,8 +75,8 @@ def meals_history(days: int = 7) -> str:
 # ---------- спорт ----------
 
 @mcp.tool()
-def log_workout(description: str, feeling: str | None = None, note: str | None = None,
-                day: str | None = None) -> str:
+def log_workout(description: str, feeling: str = "", note: str = "",
+                day: str = "") -> str:
     """Записать выполненную тренировку. description — что сделано (упражнения, подходы, веса),
     feeling — самочувствие/тяжесть по словам человека, note — замечания (боль, пропуск упражнения)."""
     db.add_workout(description, feeling, note, day)
@@ -111,7 +111,7 @@ def workout_plan() -> str:
 # ---------- календарь ----------
 
 @mcp.tool()
-def today_calendar(day: str | None = None) -> str:
+def today_calendar(day: str = "") -> str:
     """Точные сведения о дне по православному календарю: постный ли, почему, праздник ли,
     сплошная седмица ли. Плюс то же для завтра. day — дата YYYY-MM-DD, по умолчанию сегодня.
     Всегда используй этот инструмент вместо собственной памяти о датах."""
@@ -120,7 +120,7 @@ def today_calendar(day: str | None = None) -> str:
 
 
 @mcp.tool()
-def log_calendar_mark(kind: str, note: str | None = None, day: str | None = None) -> str:
+def log_calendar_mark(kind: str, note: str = "", day: str = "") -> str:
     """Отметить в журнале: kind — 'пост_соблюдён', 'пост_нарушен', 'график_соблюдён', 'график_нарушен'
     или свободное слово. note — что человек сказал, коротко и без оценок."""
     db.add_mark(kind, note, day)
