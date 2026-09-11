@@ -156,8 +156,12 @@ async def nudges(now: datetime, s: dict):
             continue
         if db.count_deliveries(day, KIND_RU[kind]) >= cap:
             continue
-        db.set_state(kind, now.isoformat(timespec="minutes"))
-        await _send(kind, text)
+        if await _send(kind, text):
+            db.set_state(kind, now.isoformat(timespec="minutes"))
+        else:
+            # связь с Telegram моргнула — попробуем снова через 10 минут, а не через N часов
+            retry_from = now - timedelta(hours=hours) + timedelta(minutes=10)
+            db.set_state(kind, retry_from.isoformat(timespec="minutes"))
 
 
 async def tick():
