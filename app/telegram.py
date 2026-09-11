@@ -9,6 +9,15 @@ from . import config
 log = logging.getLogger("byt.telegram")
 
 API = "https://api.telegram.org"
+ATTEMPTS = 4
+
+
+def _client() -> httpx.AsyncClient:
+    """Только IPv4 (local_address 0.0.0.0): из дата-центра путь к Telegram по IPv6 бывает
+    недоступен, и соединение висит до таймаута. Короткий таймаут соединения + несколько попыток
+    переживают частые «моргания» связи с api.telegram.org."""
+    transport = httpx.AsyncHTTPTransport(local_address="0.0.0.0", retries=1)
+    return httpx.AsyncClient(transport=transport, timeout=httpx.Timeout(30, connect=8))
 
 
 async def send(text: str, chat_id: str | None = None) -> bool:
@@ -18,9 +27,9 @@ async def send(text: str, chat_id: str | None = None) -> bool:
         return False
     url = f"{API}/bot{config.TELEGRAM_BOT_TOKEN}/sendMessage"
     last_error = None
-    for attempt in range(1, 4):
+    for attempt in range(1, ATTEMPTS + 1):
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(30, connect=15)) as client:
+            async with _client() as client:
                 r = await client.post(url, json={"chat_id": chat_id, "text": text})
             if r.status_code == 200:
                 return True
@@ -29,8 +38,8 @@ async def send(text: str, chat_id: str | None = None) -> bool:
         except Exception as e:  # noqa: BLE001
             last_error = e
             log.warning("Telegram, попытка %d не удалась: %s: %s", attempt, type(e).__name__, e or "(без текста)")
-            await asyncio.sleep(5 * attempt)
-    log.error("Telegram недоступен после 3 попыток: %s: %s", type(last_error).__name__, last_error)
+            await asyncio.sleep(3 * attempt)
+    log.error("Telegram недоступен после %d попыток: %s: %s", ATTEMPTS, type(last_error).__name__, last_error)
     return False
 
 
@@ -43,7 +52,7 @@ async def diagnose() -> str:
     except Exception as e:  # noqa: BLE001
         out.append(f"dns fail: {type(e).__name__}: {e}")
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(20, connect=10)) as client:
+        async with _client() as client:
             r = await client.get(f"{API}/bot{config.TELEGRAM_BOT_TOKEN}/getMe")
         out.append(f"getMe -> {r.status_code} {r.text[:120]}")
     except Exception as e:  # noqa: BLE001
