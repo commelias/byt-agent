@@ -40,4 +40,11 @@ DEFAULT_SETTINGS = {
     "abstinence_days": "",            # личный график, напр. "mon,wed,fri"; пусто — выключено
     "abstinence_time": "09:00",
     "abstinence_text": "Сегодня день по графику.",
+    # режим дня: вне этого окна сервис сам не беспокоит
+    "wake_time": "08:00",
+    "sleep_time": "23:00",
+    # забота: через сколько часов без записей спросить (0 — не спрашивать)
+    "checkin_meal_hours": "5",
+    "checkin_water_hours": "3",
+    "water_norm_ml": "2000",
 }
