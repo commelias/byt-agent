@@ -39,7 +39,11 @@ async def diag(request: Request):
     from app import telegram
     if not config.MCP_TOKEN or request.query_params.get("token") != config.MCP_TOKEN:
         return PlainTextResponse("unauthorized", status_code=401)
-    return PlainTextResponse(await telegram.diagnose())
+    lines = [await telegram.diagnose(), "", "Последние доставки:"]
+    lines += [f"{d['ts']} {d['kind']} {'ok' if d['ok'] else 'СБОЙ'} {d['detail'] or ''}" for d in db.deliveries(limit=20)]
+    lines += ["", "Разовые напоминания в очереди:"]
+    lines += [f"#{r['id']} {r['at']} {r['text']}" for r in db.pending_reminders()] or ["нет"]
+    return PlainTextResponse("\n".join(lines))
 
 
 @contextlib.asynccontextmanager
