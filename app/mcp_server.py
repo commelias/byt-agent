@@ -38,17 +38,15 @@ def _totals_line(t: dict, s: dict) -> str:
 def log_meal(description: str, kcal: float, grams: float = 0,
              protein: float = 0, fat: float = 0, carbs: float = 0,
              day: str = "") -> str:
-    """Записать приём пищи в дневник. description — блюдо и состав, kcal — калории,
-    grams — вес порции, protein/fat/carbs — БЖУ в граммах. day — дата YYYY-MM-DD, по умолчанию сегодня.
-    Возвращает итог за день."""
+    """Записать еду. description — блюдо, kcal — калории, grams — вес, protein/fat/carbs — БЖУ,
+    day — YYYY-MM-DD (по умолчанию сегодня). Возвращает итог дня."""
     db.add_meal(description, kcal, grams, protein, fat, carbs, day)
     return f"Записано: {description} — {kcal:.0f} ккал.\n" + _totals_line(db.day_totals(day), db.get_settings())
 
 
 @mcp.tool()
 def day_summary(day: str = "") -> str:
-    """Итог питания за день: список приёмов пищи и суммы калорий и БЖУ против норм.
-    day — дата YYYY-MM-DD, по умолчанию сегодня."""
+    """Итог питания за день: что съедено, суммы против норм."""
     meals = db.meals_for_day(day)
     if not meals:
         return f"За {day or db.today()} записей о еде нет."
@@ -59,14 +57,14 @@ def day_summary(day: str = "") -> str:
 
 @mcp.tool()
 def undo_last_meal(day: str = "") -> str:
-    """Удалить последнюю запись о еде за день (если ошиблись или записали дважды)."""
+    """Удалить последнюю запись о еде за день."""
     removed = db.delete_last_meal(day)
     return f"Удалено: {removed}" if removed else "Удалять нечего — записей за день нет."
 
 
 @mcp.tool()
 def meals_history(days: int = 7) -> str:
-    """Сводка питания по дням за последние N дней: калории и БЖУ за каждый день."""
+    """Питание по дням за последние N дней."""
     rows = db.meals_history(days)
     if not rows:
         return "История пуста."
@@ -79,15 +77,14 @@ def meals_history(days: int = 7) -> str:
 @mcp.tool()
 def log_workout(description: str, feeling: str = "", note: str = "",
                 day: str = "") -> str:
-    """Записать выполненную тренировку. description — что сделано (упражнения, подходы, веса),
-    feeling — самочувствие/тяжесть по словам человека, note — замечания (боль, пропуск упражнения)."""
+    """Записать тренировку: что сделано, самочувствие, замечания (боль, пропуск)."""
     db.add_workout(description, feeling, note, day)
     return "Тренировка записана."
 
 
 @mcp.tool()
 def workouts_history(count: int = 10) -> str:
-    """Последние N тренировок с датами и самочувствием."""
+    """Последние тренировки."""
     rows = db.workouts_history(count)
     if not rows:
         return "Тренировок в журнале нет."
@@ -104,7 +101,7 @@ def workouts_history(count: int = 10) -> str:
 
 @mcp.tool()
 def workout_plan() -> str:
-    """Программа и расписание тренировок из настроек."""
+    """Программа и дни тренировок."""
     s = db.get_settings()
     return (f"Дни: {s.get('workout_days')}, напоминание в {s.get('workout_time')}.\n"
             f"Программа:\n{s.get('workout_program') or '(не задана — спроси и сохрани через set_setting workout_program)'}")
@@ -114,24 +111,21 @@ def workout_plan() -> str:
 
 @mcp.tool()
 def today_calendar(day: str = "") -> str:
-    """Точные сведения о дне по православному календарю: постный ли, почему, праздник ли,
-    сплошная седмица ли. Плюс то же для завтра. day — дата YYYY-MM-DD, по умолчанию сегодня.
-    Всегда используй этот инструмент вместо собственной памяти о датах."""
+    """Православный календарь на день и завтра: пост, причина, праздник. Даты не помни сама — бери здесь."""
     d = date.fromisoformat(day) if day else db.now_local().date()
     return "Сегодня — " + orthodox.human(d) + "\nЗавтра — " + orthodox.human(d + timedelta(days=1))
 
 
 @mcp.tool()
 def log_calendar_mark(kind: str, note: str = "", day: str = "") -> str:
-    """Отметить в журнале: kind — 'пост_соблюдён', 'пост_нарушен', 'график_соблюдён', 'график_нарушен'
-    или свободное слово. note — что человек сказал, коротко и без оценок."""
+    """Отметить: kind — пост_соблюдён / пост_нарушен / график_соблюдён / график_нарушен. note — слова человека."""
     db.add_mark(kind, note, day)
     return "Отмечено."
 
 
 @mcp.tool()
 def calendar_marks_history(count: int = 14) -> str:
-    """Последние отметки по календарю (посты, личный график)."""
+    """Последние отметки по календарю."""
     rows = db.marks_history(count)
     if not rows:
         return "Отметок нет."
@@ -142,20 +136,17 @@ def calendar_marks_history(count: int = 14) -> str:
 
 @mcp.tool()
 def get_settings() -> str:
-    """Все настройки: нормы калорий и БЖУ, время вечернего итога, дни и время тренировок,
-    программа, время напоминания о календаре, личный график (дни, время, текст)."""
+    """Все настройки со значениями."""
     s = db.get_settings()
     return "\n".join(f"{k} = {v}" for k, v in sorted(s.items()))
 
 
 @mcp.tool()
 def set_setting(key: str, value: str) -> str:
-    """Изменить настройку. Ключи: norm_kcal, norm_protein, norm_fat, norm_carbs,
-    summary_time (HH:MM), workout_days (mon,tue,wed,thu,fri,sat,sun через запятую), workout_time,
-    workout_program (текст), calendar_time, abstinence_days, abstinence_time, abstinence_text,
-    wake_time и sleep_time (HH:MM, режим дня), checkin_meal_hours и checkin_water_hours
-    (через сколько часов без записей спросить о еде/воде; 0 — не спрашивать), water_norm_ml.
-    Пустая строка в abstinence_days выключает личный график."""
+    """Изменить настройку. Ключи: norm_kcal, norm_protein, norm_fat, norm_carbs, water_norm_ml,
+    summary_time, workout_days (mon..sun), workout_time, workout_program, calendar_time,
+    abstinence_days/_time/_text, wake_time, sleep_time, checkin_meal_hours, checkin_water_hours
+    (часы без записей до вопроса, 0 — молчать). Время в HH:MM."""
     if key not in config.DEFAULT_SETTINGS:
         return f"Неизвестный ключ {key}. Допустимые: {', '.join(config.DEFAULT_SETTINGS)}"
     db.set_setting(key, value.strip())
@@ -179,57 +170,53 @@ def _part_of_day(h: int) -> str:
 
 @mcp.tool()
 def context() -> str:
-    """ВЫЗЫВАЙ ПЕРЕД КАЖДЫМ ОТВЕТОМ. Текущие дата, время и время суток; календарь на сегодня и завтра;
-    что съедено и выпито сегодня и когда в последний раз; последняя тренировка; заметки о человеке
-    (его просьбы и привычки, которые надо соблюдать); запланированные напоминания; что сервис уже
-    прислал сегодня сам."""
+    """ВЫЗЫВАЙ ПЕРЕД КАЖДЫМ ОТВЕТОМ: время, календарь, еда и вода за сегодня, тренировка,
+    заметки о человеке, напоминания, что сервис уже прислал."""
     now = db.now_local()
     s = db.get_settings()
     day = now.date()
-    out = [f"Сейчас: {WEEKDAYS[now.weekday()]}, {now.strftime('%d.%m.%Y %H:%M')} ({_part_of_day(now.hour)}). "
-           f"Режим дня: подъём {s.get('wake_time')}, отбой {s.get('sleep_time')}."]
-    out.append("Календарь: сегодня — " + orthodox.human(day) + "; завтра — " + orthodox.human(day + timedelta(days=1)))
+    out = [f"{WEEKDAYS[now.weekday()]} {now.strftime('%d.%m.%Y %H:%M')}, {_part_of_day(now.hour)}; "
+           f"подъём {s.get('wake_time')}, отбой {s.get('sleep_time')}",
+           "Сегодня: " + orthodox.human(day),
+           "Завтра: " + orthodox.human(day + timedelta(days=1))]
 
     t = db.day_totals()
     last_meal = db.last_ts("meals")
-    meal = f"Еда сегодня: {t['kcal']:.0f} из {s.get('norm_kcal')} ккал, записей {t['count']}"
-    meal += f", последняя в {last_meal.strftime('%H:%M')}." if last_meal else ", записей пока нет."
-    out.append(meal)
+    out.append(f"Еда: {t['kcal']:.0f}/{s.get('norm_kcal')} ккал, {t['count']} записей"
+               + (f", последняя {last_meal.strftime('%H:%M')}" if last_meal else ""))
     last_water = db.last_ts("water")
-    water = f"Вода сегодня: {db.water_total():.0f} из {s.get('water_norm_ml')} мл"
-    water += f", последняя отметка в {last_water.strftime('%H:%M')}." if last_water else ", отметок нет."
-    out.append(water)
+    out.append(f"Вода: {db.water_total():.0f}/{s.get('water_norm_ml')} мл"
+               + (f", последняя {last_water.strftime('%H:%M')}" if last_water else ""))
 
     codes = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
-    planned = codes[now.weekday()] in s.get("workout_days", "")
+    planned = "да" if codes[now.weekday()] in s.get("workout_days", "") else "нет"
     lw = db.last_workout()
-    out.append(f"Тренировка сегодня по плану: {'да' if planned else 'нет'}. "
-               f"Последняя записанная: {lw['day'] + ' — ' + lw['description'] if lw else 'нет'}.")
+    out.append(f"Тренировка сегодня по плану: {planned}; последняя: "
+               + (f"{lw['day']} — {lw['description'][:60]}" if lw else "нет"))
 
     notes = db.list_notes()
     if notes:
-        out.append("Заметки о человеке (соблюдай):\n" + "\n".join(f"  #{n['id']} {n['text']}" for n in notes))
+        out.append("Заметки (соблюдай): " + "; ".join(f"#{n['id']} {n['text']}" for n in notes))
     rem = db.pending_reminders()
     if rem:
-        out.append("Запланированные напоминания:\n" + "\n".join(f"  #{r['id']} {r['at']} — {r['text']}" for r in rem))
+        out.append("Напоминания: " + "; ".join(f"#{r['id']} {r['at']} {r['text']}" for r in rem))
     sent = [d for d in db.deliveries(day.isoformat()) if d["ok"]]
     if sent:
-        out.append("Сервис сегодня уже прислал сам: " + ", ".join(f"{d['ts'][11:16]} {d['kind']}" for d in sent) + ".")
+        out.append("Сервис прислал сам: " + ", ".join(f"{d['ts'][11:16]} {d['kind']}" for d in sent))
     return "\n".join(out)
 
 
 @mcp.tool()
 def remember(note: str) -> str:
-    """Запомнить надолго просьбу или привычку человека: как к нему обращаться, чего не делать,
-    что он любит, особенности режима. Всё запомненное возвращается в context при каждом ответе.
-    Вызывай, когда человек просит что-то «запомнить» или меняет правила общения."""
+    """Запомнить надолго просьбу или привычку человека. Возвращается в context. Вызывай, когда он
+    просит запомнить или меняет правила общения."""
     db.add_note(note.strip())
     return f"Запомнено: {note.strip()}"
 
 
 @mcp.tool()
 def forget(note_id: int) -> str:
-    """Удалить заметку о человеке по номеру (номера видны в context)."""
+    """Удалить заметку по номеру из context."""
     return "Удалено." if db.delete_note(note_id) else f"Заметки #{note_id} нет."
 
 
@@ -237,7 +224,7 @@ def forget(note_id: int) -> str:
 
 @mcp.tool()
 def log_water(ml: float) -> str:
-    """Записать выпитую воду в миллилитрах (стакан ≈ 250, бутылка ≈ 500)."""
+    """Записать воду в мл (стакан 250, бутылка 500)."""
     db.add_water(ml)
     s = db.get_settings()
     return f"Вода: +{ml:.0f} мл, за сегодня {db.water_total():.0f} из {s.get('water_norm_ml')} мл."
@@ -266,9 +253,8 @@ def _parse_at(at: str, in_minutes: int) -> datetime | str:
 
 @mcp.tool()
 def remind_me(text: str, at: str = "", in_minutes: int = 0) -> str:
-    """Поставить разовое напоминание: сервис сам пришлёт text в Telegram в нужный момент.
-    at — «HH:MM» (сегодня, а если время прошло — завтра) или «YYYY-MM-DD HH:MM»;
-    либо in_minutes — через сколько минут. Используй, когда человек просит «напомни …»."""
+    """Разовое напоминание: сервис пришлёт text в Telegram. at — «HH:MM» (сегодня, прошло — завтра)
+    или «YYYY-MM-DD HH:MM»; либо in_minutes."""
     when = _parse_at(at, in_minutes)
     if isinstance(when, str):
         return when
