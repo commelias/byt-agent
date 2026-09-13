@@ -48,22 +48,54 @@ async def send(text: str, chat_id: str | None = None) -> bool:
     return await _call("sendMessage", {"chat_id": chat_id, "text": text})
 
 
+async def _upload(method: str, data: dict, files: dict) -> bool:
+    """Отправка файла байтами (multipart). Одна попытка: файл уже у нас, ждать смысла нет."""
+    url = f"{API}/bot{config.TELEGRAM_BOT_TOKEN}/{method}"
+    try:
+        async with _client() as client:
+            r = await client.post(url, data=data, files=files)
+        if r.status_code == 200:
+            return True
+        log.error("Telegram (%s, файлом) ответил %s: %s", method, r.status_code, r.text[:300])
+    except Exception as e:  # noqa: BLE001
+        log.warning("Telegram (%s, файлом) не удалось: %s: %s", method, type(e).__name__, e)
+    return False
+
+
+async def _fetch(photo_url: str) -> bytes | None:
+    """Скачиваем картинку сами: файл лежит в хранилище того же дата-центра, это быстро.
+    Если отдать Telegram только ссылку, он тянет файл со своей стороны и это занимает минуты."""
+    try:
+        async with _client() as client:
+            r = await client.get(photo_url, timeout=httpx.Timeout(20, connect=8))
+        if r.status_code == 200 and 0 < len(r.content) <= 9_000_000:
+            return r.content
+        log.warning("Картинку не забрали: статус %s, размер %d", r.status_code, len(r.content))
+    except Exception as e:  # noqa: BLE001
+        log.warning("Картинку не забрали: %s: %s", type(e).__name__, e)
+    return None
+
+
 async def send_photo(photo_url: str, caption: str = "", chat_id: str | None = None) -> bool:
-    """Отправить изображение по ссылке: Telegram скачивает его сам и показывает картинкой,
-    а не строкой адреса. Если фото не приняли (слишком большое, не картинка) — шлём файлом."""
+    """Прислать изображение в Telegram. Сначала пробуем быстрый путь: скачать файл самим и
+    отправить байтами. Если не вышло — отдаём Telegram ссылку, он скачает сам (медленнее)."""
     chat_id = chat_id or config.TELEGRAM_CHAT_ID
     if not config.TELEGRAM_BOT_TOKEN or not chat_id:
         log.warning("Telegram не настроен: нет TELEGRAM_BOT_TOKEN или TELEGRAM_CHAT_ID")
         return False
-    payload = {"chat_id": chat_id, "photo": photo_url}
+
+    data = {"chat_id": chat_id}
     if caption:
-        payload["caption"] = caption[:1024]
+        data["caption"] = caption[:1024]
+
+    blob = await _fetch(photo_url)
+    if blob and await _upload("sendPhoto", data, {"photo": ("image.png", blob, "image/png")}):
+        return True
+
+    payload = dict(data, photo=photo_url)
     if await _call("sendPhoto", payload):
         return True
-    doc = {"chat_id": chat_id, "document": photo_url}
-    if caption:
-        doc["caption"] = caption[:1024]
-    return await _call("sendDocument", doc)
+    return await _call("sendDocument", dict(data, document=photo_url))
 
 
 async def diagnose() -> str:
