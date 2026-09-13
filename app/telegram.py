@@ -69,15 +69,20 @@ async def _upload(method: str, data: dict, files: dict) -> bool:
 
 async def _fetch(photo_url: str) -> bytes | None:
     """Скачиваем картинку сами: файл лежит в хранилище того же дата-центра, это быстро.
-    Если отдать Telegram только ссылку, он тянет файл со своей стороны и это занимает минуты."""
-    try:
-        async with _client() as client:
-            r = await client.get(photo_url, timeout=httpx.Timeout(20, connect=8))
-        if r.status_code == 200 and 0 < len(r.content) <= 9_000_000:
-            return r.content
-        log.warning("Картинку не забрали: статус %s, размер %d", r.status_code, len(r.content))
-    except Exception as e:  # noqa: BLE001
-        log.warning("Картинку не забрали: %s: %s", type(e).__name__, e)
+    Сразу после генерации файл в хранилище появляется не мгновенно, поэтому несколько попыток:
+    403 от S3 означает и «нет доступа», и «объекта ещё нет»."""
+    for attempt in (1, 2, 3):
+        try:
+            async with _client() as client:
+                r = await client.get(photo_url, timeout=httpx.Timeout(20, connect=8))
+            if r.status_code == 200 and 0 < len(r.content) <= 9_000_000:
+                return r.content
+            log.warning("Картинку не забрали (попытка %d): статус %s, адрес %s",
+                        attempt, r.status_code, photo_url)
+        except Exception as e:  # noqa: BLE001
+            log.warning("Картинку не забрали (попытка %d): %s: %s", attempt, type(e).__name__, e)
+        if attempt < 3:
+            await asyncio.sleep(2)
     return None
 
 
