@@ -7,6 +7,8 @@ import httpx
 from . import config
 
 log = logging.getLogger("byt.telegram")
+# httpx печатает полный адрес запроса, а в нём токен бота — в логах приложения ему не место
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 API = "https://api.telegram.org"
 ATTEMPTS = 4
@@ -20,11 +22,11 @@ def _client() -> httpx.AsyncClient:
     return httpx.AsyncClient(transport=transport, timeout=httpx.Timeout(30, connect=8))
 
 
-async def _call(method: str, payload: dict) -> bool:
+async def _call(method: str, payload: dict, attempts: int = ATTEMPTS) -> bool:
     """Один вызов Bot API с повторами: связь дата-центра с Telegram периодически моргает."""
     url = f"{API}/bot{config.TELEGRAM_BOT_TOKEN}/{method}"
     last_error = None
-    for attempt in range(1, ATTEMPTS + 1):
+    for attempt in range(1, attempts + 1):
         try:
             async with _client() as client:
                 r = await client.post(url, json=payload)
@@ -35,8 +37,9 @@ async def _call(method: str, payload: dict) -> bool:
         except Exception as e:  # noqa: BLE001
             last_error = e
             log.warning("Telegram (%s), попытка %d не удалась: %s: %s", method, attempt, type(e).__name__, e or "(без текста)")
-            await asyncio.sleep(3 * attempt)
-    log.error("Telegram недоступен после %d попыток: %s: %s", ATTEMPTS, type(last_error).__name__, last_error)
+            if attempt < attempts:
+                await asyncio.sleep(3 * attempt)
+    log.error("Telegram недоступен после %d попыток: %s: %s", attempts, type(last_error).__name__, last_error)
     return False
 
 
@@ -77,8 +80,8 @@ async def _fetch(photo_url: str) -> bytes | None:
 
 
 async def send_photo(photo_url: str, caption: str = "", chat_id: str | None = None) -> bool:
-    """Прислать изображение в Telegram. Сначала пробуем быстрый путь: скачать файл самим и
-    отправить байтами. Если не вышло — отдаём Telegram ссылку, он скачает сам (медленнее)."""
+    """Прислать изображение в Telegram. Быстрый путь: скачиваем файл сами (хранилище в том же
+    дата-центре) и отправляем байтами."""
     chat_id = chat_id or config.TELEGRAM_CHAT_ID
     if not config.TELEGRAM_BOT_TOKEN or not chat_id:
         log.warning("Telegram не настроен: нет TELEGRAM_BOT_TOKEN или TELEGRAM_CHAT_ID")
@@ -89,13 +92,18 @@ async def send_photo(photo_url: str, caption: str = "", chat_id: str | None = No
         data["caption"] = caption[:1024]
 
     blob = await _fetch(photo_url)
-    if blob and await _upload("sendPhoto", data, {"photo": ("image.png", blob, "image/png")}):
-        return True
+    if blob:
+        for attempt in (1, 2):
+            if await _upload("sendPhoto", data, {"photo": ("image.png", blob, "image/png")}):
+                return True
+            if attempt == 1:
+                await asyncio.sleep(3)
+        return False
 
-    payload = dict(data, photo=photo_url)
-    if await _call("sendPhoto", payload):
-        return True
-    return await _call("sendDocument", dict(data, document=photo_url))
+    # Файл не забрали (хранилище недоступно) — просим Telegram скачать самому. Он умеет это
+    # не всегда: к хранилищу Timeweb ходит плохо и отвечает «failed to get HTTP URL content»,
+    # поэтому здесь одна попытка, без долгих повторов.
+    return await _call("sendPhoto", dict(data, photo=photo_url), attempts=1)
 
 
 async def diagnose() -> str:
