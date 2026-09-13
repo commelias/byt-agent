@@ -1,4 +1,5 @@
 """MCP-сервер «Журнал» — руки агента: записать, прочитать, настроить."""
+import time
 from datetime import date, datetime, timedelta
 
 from mcp.server.fastmcp import FastMCP
@@ -240,8 +241,10 @@ async def send_image(url: str, caption: str = "") -> str:
     url = (url or "").strip()
     if not url.startswith("http"):
         return "Нужен полный адрес картинки, начинающийся с http."
+    started = time.monotonic()
     ok = await telegram.send_photo(url, caption.strip())
-    db.log_delivery("картинка", ok, "" if ok else "Telegram не принял изображение")
+    took = f"{time.monotonic() - started:.1f} с"
+    db.log_delivery("картинка", ok, took if ok else f"Telegram не принял изображение ({took})")
     return "Картинка отправлена." if ok else "Не удалось отправить картинку, попробуй ещё раз чуть позже."
 
 
