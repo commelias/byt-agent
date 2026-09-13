@@ -4,7 +4,7 @@ from datetime import date, datetime, timedelta
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
-from . import config, db, orthodox
+from . import config, db, orthodox, telegram
 
 mcp = FastMCP(
     # Сервер живёт за публичным доменом App Platform, а не на localhost;
@@ -228,6 +228,21 @@ def log_water(ml: float) -> str:
     db.add_water(ml)
     s = db.get_settings()
     return f"Вода: +{ml:.0f} мл, за сегодня {db.water_total():.0f} из {s.get('water_norm_ml')} мл."
+
+
+# ---------- картинки ----------
+
+@mcp.tool()
+async def send_image(url: str, caption: str = "") -> str:
+    """Прислать человеку картинку в Telegram по её адресу, чтобы она пришла изображением,
+    а не строкой со ссылкой. Вызывай сразу после того, как нарисовала картинку.
+    caption — одна короткая строка подписи."""
+    url = (url or "").strip()
+    if not url.startswith("http"):
+        return "Нужен полный адрес картинки, начинающийся с http."
+    ok = await telegram.send_photo(url, caption.strip())
+    db.log_delivery("картинка", ok, "" if ok else "Telegram не принял изображение")
+    return "Картинка отправлена." if ok else "Не удалось отправить картинку, попробуй ещё раз чуть позже."
 
 
 # ---------- разовые напоминания ----------
