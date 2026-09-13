@@ -52,10 +52,12 @@ async def send(text: str, chat_id: str | None = None) -> bool:
 
 
 async def _upload(method: str, data: dict, files: dict) -> bool:
-    """Отправка файла байтами (multipart). Одна попытка: файл уже у нас, ждать смысла нет."""
+    """Отправка файла байтами (multipart). Соединение с Telegram из дата-центра моргает,
+    поэтому таймаут на установку связи здесь щедрее, чем для обычных сообщений."""
     url = f"{API}/bot{config.TELEGRAM_BOT_TOKEN}/{method}"
+    transport = httpx.AsyncHTTPTransport(local_address="0.0.0.0", retries=2)
     try:
-        async with _client() as client:
+        async with httpx.AsyncClient(transport=transport, timeout=httpx.Timeout(60, connect=20)) as client:
             r = await client.post(url, data=data, files=files)
         if r.status_code == 200:
             return True
@@ -81,7 +83,7 @@ async def _fetch(photo_url: str) -> bytes | None:
 
 async def send_photo(photo_url: str, caption: str = "", chat_id: str | None = None) -> bool:
     """Прислать изображение в Telegram. Быстрый путь: скачиваем файл сами (хранилище в том же
-    дата-центре) и отправляем байтами."""
+    дата-центре) и отправляем байтами, до трёх попыток — связь моргает."""
     chat_id = chat_id or config.TELEGRAM_CHAT_ID
     if not config.TELEGRAM_BOT_TOKEN or not chat_id:
         log.warning("Telegram не настроен: нет TELEGRAM_BOT_TOKEN или TELEGRAM_CHAT_ID")
@@ -93,11 +95,11 @@ async def send_photo(photo_url: str, caption: str = "", chat_id: str | None = No
 
     blob = await _fetch(photo_url)
     if blob:
-        for attempt in (1, 2):
+        for attempt in (1, 2, 3):
             if await _upload("sendPhoto", data, {"photo": ("image.png", blob, "image/png")}):
                 return True
-            if attempt == 1:
-                await asyncio.sleep(3)
+            if attempt < 3:
+                await asyncio.sleep(2 * attempt)
         return False
 
     # Файл не забрали (хранилище недоступно) — просим Telegram скачать самому. Он умеет это
