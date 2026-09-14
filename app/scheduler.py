@@ -1,8 +1,9 @@
-"""Часы: раз в минуту смотрим настройки и шлём то, что подошло по времени.
+"""Часы: раз в минуту смотрим расписание и складываем в очередь то, что подошло по времени.
 
-Расписание меняется агентом через set_setting без перезапуска сервиса.
-reminders_sent гарантирует, что плановое напоминание уходит один раз в день;
-delivery_log — журнал всего, что сервис прислал сам (его видит агент в context).
+Отправкой занимается один воркер (flush) — у него единственная логика повторов на весь сервис.
+Раньше «повторить, если не ушло» было написано трижды и по-разному.
+reminders_sent гарантирует, что плановое уходит один раз в день; delivery_log — журнал того,
+что сервис прислал сам (его видит агент в context).
 """
 import logging
 from datetime import datetime, timedelta
@@ -13,14 +14,17 @@ from . import agent, config, db, orthodox, telegram
 
 log = logging.getLogger("byt.scheduler")
 
-DAY_CODES = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
-KIND_RU = {"summary": "итог дня", "workout": "тренировка", "calendar": "календарь",
-           "abstinence": "личный график", "nudge_meal": "вопрос о еде",
-           "nudge_water": "вопрос о воде", "custom": "разовое напоминание"}
+MAX_ATTEMPTS = 5          # после этого сообщение помечается несостоявшимся и видно в /diag
+BATCH = 6                 # сколько сообщений отправляем за один тик
+
+KIND = {"summary": "итог дня", "workout": "тренировка", "calendar": "календарь",
+        "abstinence": "личный график", "nudge_meal": "вопрос о еде",
+        "nudge_water": "вопрос о воде", "custom": "разовое напоминание",
+        "workout_check": "вопрос о тренировке", "plan": "напоминание"}
 
 
 def _days(value: str) -> set[int]:
-    return {DAY_CODES.index(x) for x in value.replace(" ", "").lower().split(",") if x in DAY_CODES}
+    return {db.DAY_CODES.index(x) for x in value.replace(" ", "").lower().split(",") if x in db.DAY_CODES}
 
 
 def _hm(hhmm: str):
@@ -31,14 +35,14 @@ def _hm(hhmm: str):
         return None
 
 
-def _due(now: datetime, hhmm: str) -> bool:
-    """Настроенное время наступило, но прошло не больше двух часов (догоняем после простоя,
-    но не вываливаем все напоминания разом после позднего развёртывания)."""
+def _due(now: datetime, hhmm: str, window: int = 120) -> bool:
+    """Время наступило, но прошло не больше окна (догоняем после простоя, но не вываливаем
+    все напоминания разом после позднего развёртывания)."""
     hm = _hm(hhmm)
     if not hm:
         return False
     delta = (now.hour * 60 + now.minute) - (hm[0] * 60 + hm[1])
-    return 0 <= delta <= 120
+    return 0 <= delta <= window
 
 
 def _at_today(now: datetime, hhmm: str, default: str) -> datetime:
@@ -46,13 +50,7 @@ def _at_today(now: datetime, hhmm: str, default: str) -> datetime:
     return now.replace(hour=h, minute=m, second=0, microsecond=0)
 
 
-async def _send(kind: str, text: str) -> bool:
-    ok = await telegram.send(text)
-    db.log_delivery(KIND_RU.get(kind, kind), ok, "" if ok else "Telegram не принял сообщение")
-    return ok
-
-
-# ---------- плановые ----------
+# ---------- что именно сказать ----------
 
 async def evening_summary(now: datetime, s: dict) -> str:
     day = now.date().isoformat()
@@ -65,14 +63,18 @@ async def evening_summary(now: datetime, s: dict) -> str:
              f"Б {totals['protein']:.0f}/{s['norm_protein']} · Ж {totals['fat']:.0f}/{s['norm_fat']} · "
              f"У {totals['carbs']:.0f}/{s['norm_carbs']}. {water}")
     detail = "\n".join(f"- {m['description']} — {float(m['kcal']):.0f} ккал" for m in meals)
-    prompt = (f"Составь вечерний итог по питанию за сегодня — 3–5 строк, спокойно, без похвал и нотаций. "
+    prompt = ("Составь вечерний итог по питанию за сегодня — 3–5 строк, спокойно, без похвал и нотаций. "
               f"Данные:\n{detail}\n{plain}")
     return await agent.ask(prompt) or f"{plain}\n{detail}"
 
 
-async def workout_reminder(now: datetime, s: dict) -> str:
+async def workout_reminder(now: datetime, s: dict) -> str | None:
+    planned, why = db.workout_planned(now.date().isoformat(), s.get("workout_days", ""))
+    if not planned:
+        return None
+    head = "Сегодня тренировка по плану." if not why else f"Сегодня тренировка ({why})."
     program = s.get("workout_program", "").strip()
-    return "Сегодня тренировка по плану." + (f"\n{program}" if program else "")
+    return head + (f"\n{program}" if program else "")
 
 
 async def calendar_reminder(now: datetime, s: dict) -> str | None:
@@ -87,27 +89,59 @@ async def abstinence_reminder(now: datetime, s: dict) -> str:
     return s.get("abstinence_text") or "Сегодня день по графику."
 
 
+async def workout_check(now: datetime, s: dict) -> str | None:
+    """Вечером спросить о тренировке, если она была запланирована на сегодня и не записана.
+    Смотрит исключения, поэтому перенос на выходной не теряется."""
+    day = now.date().isoformat()
+    planned, why = db.workout_planned(day, s.get("workout_days", ""))
+    if not planned or db.workout_on(day):
+        return None
+    hint = f" (перенос: {why})" if why else ""
+    return f"Тренировка на сегодня в плане{hint}, а записи нет. Была? Как колено?"
+
+
+# ---------- плановые ----------
+
 async def planned(now: datetime, s: dict):
     day = now.date().isoformat()
     wd = now.weekday()
     checks = [
         ("summary", s.get("summary_time", ""), True, evening_summary),
-        ("workout", s.get("workout_time", ""), wd in _days(s.get("workout_days", "")), workout_reminder),
+        ("workout", s.get("workout_time", ""), True, workout_reminder),
         ("calendar", s.get("calendar_time", ""), True, calendar_reminder),
         ("abstinence", s.get("abstinence_time", ""), wd in _days(s.get("abstinence_days", "")), abstinence_reminder),
+        ("workout_check", s.get("workout_check_time", ""), True, workout_check),
     ]
     for kind, hhmm, applies, handler in checks:
         if not applies or not _due(now, hhmm) or not db.reminder_claim(day, kind):
             continue
         try:
             text = await handler(now, s)
-            if text is None:
-                continue  # сегодня нечего сообщать (например, завтра не постный день)
-            if not await _send(kind, text):
-                db.reminder_unclaim(day, kind)  # следующий тик попробует снова
+            if text:
+                db.enqueue(KIND[kind], text)
         except Exception as e:  # noqa: BLE001
-            db.reminder_unclaim(day, kind)
             log.error("Ошибка напоминания %s: %s: %s", kind, type(e).__name__, e)
+
+
+async def user_plans(now: datetime):
+    """Повторяющиеся напоминания, заведённые агентом: текстом или ссылкой на точный текст."""
+    day = now.date().isoformat()
+    for p in db.list_plans(only_enabled=True):
+        days = (p["days"] or "").strip()
+        if days and days != "all" and now.weekday() not in _days(days):
+            continue
+        if not _due(now, p["at"]) or not db.reminder_claim(day, f"plan{p['id']}"):
+            continue
+        body = (p["body"] or "").strip()
+        if p["text_key"]:
+            saved = db.get_text(p["text_key"])
+            if not saved:
+                log.error("План #%s ссылается на текст «%s», которого нет", p["id"], p["text_key"])
+                continue
+            title = (saved["title"] or p["title"]).strip()
+            body = (f"{title}\n\n" if title else "") + saved["body"]
+        if body:
+            db.enqueue(KIND["plan"], body)
 
 
 # ---------- разовые ----------
@@ -117,10 +151,8 @@ async def custom(now: datetime):
     for r in db.pending_reminders():
         if r["at"] > stamp:
             break  # список отсортирован по времени
-        ok = await _send("custom", "Напоминание: " + r["text"])
-        overdue = datetime.strptime(r["at"], "%Y-%m-%d %H:%M").replace(tzinfo=now.tzinfo) < now - timedelta(hours=2)
-        if ok or overdue:
-            db.mark_reminder_sent(r["id"])
+        db.enqueue(KIND["custom"], "Напоминание: " + r["text"])
+        db.mark_reminder_sent(r["id"])
 
 
 # ---------- забота: давно нет записей ----------
@@ -154,20 +186,39 @@ async def nudges(now: datetime, s: dict):
             since = max(since, datetime.fromisoformat(last_nudge))
         if now - since < timedelta(hours=hours):
             continue
-        if db.count_deliveries(day, KIND_RU[kind]) >= cap:
+        if db.count_deliveries(day, KIND[kind]) >= cap:
             continue
-        if await _send(kind, text):
-            db.set_state(kind, now.isoformat(timespec="minutes"))
+        db.enqueue(KIND[kind], text)
+        db.set_state(kind, now.isoformat(timespec="minutes"))
+
+
+# ---------- единственный отправщик ----------
+
+async def flush(now: datetime):
+    """Забрать очередь и отправить. Здесь же повторы: сеть до Telegram моргает регулярно."""
+    for item in db.outbox_pending(limit=BATCH):
+        ok = False
+        try:
+            ok = await telegram.send(item["text"])
+        except Exception as e:  # noqa: BLE001
+            log.error("Отправка сорвалась: %s: %s", type(e).__name__, e)
+        if ok:
+            db.outbox_done(item["id"])
+            db.log_delivery(item["kind"], True)
+            continue
+        attempts = int(item["attempts"]) + 1
+        if attempts >= MAX_ATTEMPTS:
+            db.outbox_give_up(item["id"], attempts, "Telegram не принял сообщение")
+            db.log_delivery(item["kind"], False, f"не доставлено за {attempts} попыток")
         else:
-            # связь с Telegram моргнула — попробуем снова через 10 минут, а не через N часов
-            retry_from = now - timedelta(hours=hours) + timedelta(minutes=10)
-            db.set_state(kind, retry_from.isoformat(timespec="minutes"))
+            nxt = (now + timedelta(minutes=3 * attempts)).isoformat(timespec="minutes")
+            db.outbox_retry(item["id"], attempts, nxt, "Telegram не принял сообщение")
 
 
 async def tick():
     now = db.now_local()
     s = db.get_settings()
-    for step in (planned(now, s), custom(now), nudges(now, s)):
+    for step in (planned(now, s), user_plans(now), custom(now), nudges(now, s), flush(now)):
         try:
             await step
         except Exception as e:  # noqa: BLE001

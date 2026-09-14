@@ -1,11 +1,10 @@
-"""MCP-сервер «Журнал» — руки агента: записать, прочитать, настроить."""
-import time
+"""MCP-сервер «Журнал» — руки агента: записать, прочитать, настроить, напомнить."""
 from datetime import date, datetime, timedelta
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
-from . import config, db, orthodox, telegram
+from . import config, db, orthodox
 
 mcp = FastMCP(
     # Сервер живёт за публичным доменом App Platform, а не на localhost;
@@ -14,8 +13,8 @@ mcp = FastMCP(
     transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
     instructions=(
         "Журнал быта одного человека: питание, вода, тренировки, православный календарь, настройки, "
-        "заметки о человеке и разовые напоминания. Перед ответом на каждое сообщение вызывай context — "
-        "это текущее время и память. Записывай каждый приём пищи, воду и тренировку сразу."
+        "заметки о человеке, напоминания и точные тексты. Перед ответом на каждое сообщение вызывай "
+        "context — это текущее время и память. Записывай каждый приём пищи, воду и тренировку сразу."
     ),
     stateless_http=True,
     json_response=True,
@@ -33,6 +32,22 @@ def _totals_line(t: dict, s: dict) -> str:
             f"У {t['carbs']:.0f}/{s.get('norm_carbs')}")
 
 
+def _day(value: str) -> str:
+    """Пустая строка — сегодня; «завтра» и «вчера» тоже понимаем, чтобы не гадать с датами."""
+    v = (value or "").strip().lower()
+    today = db.now_local().date()
+    if not v or v == "сегодня":
+        return today.isoformat()
+    if v == "завтра":
+        return (today + timedelta(days=1)).isoformat()
+    if v == "вчера":
+        return (today - timedelta(days=1)).isoformat()
+    try:
+        return date.fromisoformat(v).isoformat()
+    except ValueError:
+        return ""
+
+
 # ---------- питание ----------
 
 @mcp.tool()
@@ -41,25 +56,26 @@ def log_meal(description: str, kcal: float, grams: float = 0,
              day: str = "") -> str:
     """Записать еду. description — блюдо, kcal — калории, grams — вес, protein/fat/carbs — БЖУ,
     day — YYYY-MM-DD (по умолчанию сегодня). Возвращает итог дня."""
-    db.add_meal(description, kcal, grams, protein, fat, carbs, day)
-    return f"Записано: {description} — {kcal:.0f} ккал.\n" + _totals_line(db.day_totals(day), db.get_settings())
+    db.add_meal(description, kcal, grams, protein, fat, carbs, _day(day) or None)
+    return f"Записано: {description} — {kcal:.0f} ккал.\n" + _totals_line(db.day_totals(_day(day)), db.get_settings())
 
 
 @mcp.tool()
 def day_summary(day: str = "") -> str:
     """Итог питания за день: что съедено, суммы против норм."""
-    meals = db.meals_for_day(day)
+    d = _day(day)
+    meals = db.meals_for_day(d)
     if not meals:
-        return f"За {day or db.today()} записей о еде нет."
+        return f"За {d} записей о еде нет."
     lines = [f"{m['ts'][11:16]} {m['description']} — {_fmt(m['grams'])} г, {_fmt(m['kcal'])} ккал, "
              f"Б {_fmt(m['protein'])} / Ж {_fmt(m['fat'])} / У {_fmt(m['carbs'])}" for m in meals]
-    return "\n".join(lines) + "\n" + _totals_line(db.day_totals(day), db.get_settings())
+    return "\n".join(lines) + "\n" + _totals_line(db.day_totals(d), db.get_settings())
 
 
 @mcp.tool()
 def undo_last_meal(day: str = "") -> str:
     """Удалить последнюю запись о еде за день."""
-    removed = db.delete_last_meal(day)
+    removed = db.delete_last_meal(_day(day))
     return f"Удалено: {removed}" if removed else "Удалять нечего — записей за день нет."
 
 
@@ -73,13 +89,20 @@ def meals_history(days: int = 7) -> str:
                      f"Ж {float(r['fat'] or 0):.0f} / У {float(r['carbs'] or 0):.0f} ({r['n']} записей)" for r in rows)
 
 
+@mcp.tool()
+def log_water(ml: float) -> str:
+    """Записать воду в мл (стакан 250, бутылка 500)."""
+    db.add_water(ml)
+    s = db.get_settings()
+    return f"Вода: +{ml:.0f} мл, за сегодня {db.water_total():.0f} из {s.get('water_norm_ml')} мл."
+
+
 # ---------- спорт ----------
 
 @mcp.tool()
-def log_workout(description: str, feeling: str = "", note: str = "",
-                day: str = "") -> str:
+def log_workout(description: str, feeling: str = "", note: str = "", day: str = "") -> str:
     """Записать тренировку: что сделано, самочувствие, замечания (боль, пропуск)."""
-    db.add_workout(description, feeling, note, day)
+    db.add_workout(description, feeling, note, _day(day) or None)
     return "Тренировка записана."
 
 
@@ -102,35 +125,179 @@ def workouts_history(count: int = 10) -> str:
 
 @mcp.tool()
 def workout_plan() -> str:
-    """Программа и дни тренировок."""
+    """Программа, дни тренировок и ближайшие переносы."""
     s = db.get_settings()
-    return (f"Дни: {s.get('workout_days')}, напоминание в {s.get('workout_time')}.\n"
-            f"Программа:\n{s.get('workout_program') or '(не задана — спроси и сохрани через set_setting workout_program)'}")
+    out = [f"Дни: {s.get('workout_days')}, напоминание в {s.get('workout_time')}, "
+           f"вечерняя проверка в {s.get('workout_check_time')}."]
+    ex = db.workout_overrides()
+    if ex:
+        out.append("Исключения: " + "; ".join(
+            f"{e['day']} — {'тренировка' if e['planned'] else 'без тренировки'}"
+            + (f" ({e['note']})" if e["note"] else "") for e in ex))
+    out.append("Программа:\n" + (s.get("workout_program") or "(не задана — спроси и сохрани через set_setting workout_program)"))
+    return "\n".join(out)
 
 
-# ---------- календарь ----------
+@mcp.tool()
+def move_workout(to_day: str, from_day: str = "", note: str = "") -> str:
+    """Перенести тренировку: to_day — когда будет, from_day — откуда сняли (можно пусто).
+    Даты YYYY-MM-DD или «сегодня»/«завтра». Вечером сервис сам спросит про неё в новый день.
+    Обязательно вызывай, когда договорились о переносе, иначе расписание останется прежним."""
+    to_iso = _day(to_day)
+    if not to_iso:
+        return "Не понял дату переноса. Нужно YYYY-MM-DD, «сегодня» или «завтра»."
+    src = _day(from_day) if from_day else ""
+    db.set_workout_day(to_iso, True, note.strip() or (f"перенос с {src}" if src else "перенос"))
+    if src:
+        db.set_workout_day(src, False, f"перенесена на {to_iso}")
+    return f"Тренировка перенесена{f' с {src}' if src else ''} на {to_iso}. Вечером спрошу о ней."
+
+
+# ---------- календарь и духовная часть ----------
 
 @mcp.tool()
 def today_calendar(day: str = "") -> str:
     """Православный календарь на день и завтра: пост, причина, праздник. Даты не помни сама — бери здесь."""
-    d = date.fromisoformat(day) if day else db.now_local().date()
+    d = date.fromisoformat(_day(day))
     return "Сегодня — " + orthodox.human(d) + "\nЗавтра — " + orthodox.human(d + timedelta(days=1))
 
 
 @mcp.tool()
 def log_calendar_mark(kind: str, note: str = "", day: str = "") -> str:
-    """Отметить: kind — пост_соблюдён / пост_нарушен / график_соблюдён / график_нарушен. note — слова человека."""
-    db.add_mark(kind, note, day)
+    """Отметить: kind — пост_соблюдён / пост_нарушен / график_соблюдён / график_нарушен /
+    правило_прочитано / правило_пропущено. note — слова человека."""
+    db.add_mark(kind, note, _day(day) or None)
     return "Отмечено."
 
 
 @mcp.tool()
 def calendar_marks_history(count: int = 14) -> str:
-    """Последние отметки по календарю."""
+    """Последние отметки по календарю и правилу."""
     rows = db.marks_history(count)
     if not rows:
         return "Отметок нет."
     return "\n".join(f"{r['day']}: {r['kind']}" + (f" — {r['note']}" if r["note"] else "") for r in rows)
+
+
+# ---------- точные тексты ----------
+
+@mcp.tool()
+def saved_text(key: str, body: str = "", title: str = "") -> str:
+    """Точный текст, который сервис шлёт человеку дословно, минуя тебя: молитвенное правило,
+    программа, список. Без body — сведения о сохранённом; с body — сохранить или заменить.
+    Сам текст тебе не возвращается: длинные тексты пересказывать нельзя, только отправлять."""
+    key = key.strip().lower()
+    if body:
+        db.set_text(key, body.strip(), title.strip())
+        return f"Текст «{key}» сохранён, {len(body.strip())} знаков. Отправить — send_saved_text."
+    saved = db.get_text(key)
+    if not saved:
+        have = ", ".join(t["key"] for t in db.list_texts()) or "ничего"
+        return f"Текста «{key}» нет. Сохранено: {have}."
+    return (f"«{key}»: {saved['title'] or 'без заголовка'}, {len(saved['body'])} знаков, "
+            f"обновлён {saved['updated']}. Первые строки: {saved['body'][:120]}…")
+
+
+@mcp.tool()
+def send_saved_text(key: str) -> str:
+    """Отправить человеку сохранённый текст дословно. Пользуйся этим вместо того, чтобы
+    выписывать длинный текст в ответе: так он не оборвётся и не изменится."""
+    key = key.strip().lower()
+    saved = db.get_text(key)
+    if not saved:
+        return f"Текста «{key}» нет."
+    title = (saved["title"] or "").strip()
+    db.enqueue("сохранённый текст", (f"{title}\n\n" if title else "") + saved["body"])
+    return "Отправила."
+
+
+# ---------- повторяющиеся напоминания ----------
+
+@mcp.tool()
+def add_plan(title: str, at: str, days: str = "all", text: str = "", text_key: str = "") -> str:
+    """Повторяющееся напоминание: title — название, at — время HH:MM, days — all или mon,wed,fri.
+    text — что прислать, либо text_key — ключ сохранённого текста. Заводи, когда человек просит
+    напоминать регулярно: заметка о такой просьбе не работает, напоминание шлёт только сервис."""
+    if not _hm_ok(at):
+        return "Время нужно в виде HH:MM."
+    if not text and not text_key:
+        return "Нужен text или text_key."
+    if text_key and not db.get_text(text_key.strip().lower()):
+        return f"Текста «{text_key}» нет — сначала сохрани его через saved_text."
+    pid = db.add_plan(title.strip(), at.strip(), days.strip().lower(), text.strip(), text_key.strip().lower())
+    return f"Напоминание #{pid} «{title.strip()}» в {at.strip()}, дни: {days.strip().lower()}."
+
+
+@mcp.tool()
+def list_plans() -> str:
+    """Повторяющиеся напоминания сервиса."""
+    rows = db.list_plans()
+    if not rows:
+        return "Повторяющихся напоминаний нет."
+    return "\n".join(f"#{r['id']} {r['at']} {r['days'] or 'all'} — {r['title']}"
+                     + (f" [текст: {r['text_key']}]" if r["text_key"] else "")
+                     + ("" if r["enabled"] else " (выключено)") for r in rows)
+
+
+@mcp.tool()
+def remove_plan(plan_id: int) -> str:
+    """Убрать повторяющееся напоминание по номеру."""
+    return "Убрано." if db.delete_plan(plan_id) else f"Напоминания #{plan_id} нет."
+
+
+# ---------- разовые напоминания ----------
+
+def _hm_ok(hhmm: str) -> bool:
+    try:
+        h, m = map(int, hhmm.strip().split(":"))
+        return 0 <= h < 24 and 0 <= m < 60
+    except (ValueError, AttributeError):
+        return False
+
+
+def _parse_at(at: str, in_minutes: int) -> datetime | str:
+    now = db.now_local()
+    if in_minutes and in_minutes > 0:
+        return now + timedelta(minutes=in_minutes)
+    at = (at or "").strip().replace("T", " ")
+    for fmt in ("%Y-%m-%d %H:%M", "%d.%m.%Y %H:%M", "%d.%m %H:%M", "%H:%M"):
+        try:
+            p = datetime.strptime(at, fmt)
+        except ValueError:
+            continue
+        if fmt == "%H:%M":
+            t = now.replace(hour=p.hour, minute=p.minute, second=0, microsecond=0)
+            return t if t > now else t + timedelta(days=1)
+        if fmt == "%d.%m %H:%M":
+            p = p.replace(year=now.year)
+        return p.replace(tzinfo=now.tzinfo)
+    return "Не понял время. Нужно HH:MM, YYYY-MM-DD HH:MM или in_minutes."
+
+
+@mcp.tool()
+def remind_me(text: str, at: str = "", in_minutes: int = 0) -> str:
+    """Разовое напоминание: сервис пришлёт text в Telegram. at — «HH:MM» (сегодня, прошло — завтра)
+    или «YYYY-MM-DD HH:MM»; либо in_minutes. Регулярное — не сюда, а в add_plan."""
+    when = _parse_at(at, in_minutes)
+    if isinstance(when, str):
+        return when
+    if when <= db.now_local():
+        return "Это время уже прошло."
+    db.add_custom_reminder(when.strftime("%Y-%m-%d %H:%M"), text.strip())
+    return f"Напомню {when.strftime('%d.%m в %H:%M')}: {text.strip()}"
+
+
+@mcp.tool()
+def list_reminders() -> str:
+    """Запланированные разовые напоминания."""
+    rows = db.pending_reminders()
+    return "\n".join(f"#{r['id']} {r['at']} — {r['text']}" for r in rows) if rows else "Разовых напоминаний нет."
+
+
+@mcp.tool()
+def cancel_reminder(reminder_id: int) -> str:
+    """Отменить разовое напоминание по номеру."""
+    return "Отменено." if db.cancel_reminder(reminder_id) else f"Напоминания #{reminder_id} нет."
 
 
 # ---------- настройки ----------
@@ -145,9 +312,9 @@ def get_settings() -> str:
 @mcp.tool()
 def set_setting(key: str, value: str) -> str:
     """Изменить настройку. Ключи: norm_kcal, norm_protein, norm_fat, norm_carbs, water_norm_ml,
-    summary_time, workout_days (mon..sun), workout_time, workout_program, calendar_time,
-    abstinence_days/_time/_text, wake_time, sleep_time, checkin_meal_hours, checkin_water_hours
-    (часы без записей до вопроса, 0 — молчать). Время в HH:MM."""
+    summary_time, workout_days (mon..sun), workout_time, workout_check_time, workout_program,
+    calendar_time, abstinence_days/_time/_text, wake_time, sleep_time, checkin_meal_hours,
+    checkin_water_hours (часы без записей до вопроса, 0 — молчать). Время в HH:MM."""
     if key not in config.DEFAULT_SETTINGS:
         return f"Неизвестный ключ {key}. Допустимые: {', '.join(config.DEFAULT_SETTINGS)}"
     db.set_setting(key, value.strip())
@@ -176,6 +343,7 @@ def context() -> str:
     now = db.now_local()
     s = db.get_settings()
     day = now.date()
+    iso = day.isoformat()
     out = [f"{WEEKDAYS[now.weekday()]} {now.strftime('%d.%m.%Y %H:%M')}, {_part_of_day(now.hour)}; "
            f"подъём {s.get('wake_time')}, отбой {s.get('sleep_time')}",
            "Сегодня: " + orthodox.human(day),
@@ -189,108 +357,44 @@ def context() -> str:
     out.append(f"Вода: {db.water_total():.0f}/{s.get('water_norm_ml')} мл"
                + (f", последняя {last_water.strftime('%H:%M')}" if last_water else ""))
 
-    codes = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
-    planned = "да" if codes[now.weekday()] in s.get("workout_days", "") else "нет"
+    planned, why = db.workout_planned(iso, s.get("workout_days", ""))
     lw = db.last_workout()
-    out.append(f"Тренировка сегодня по плану: {planned}; последняя: "
-               + (f"{lw['day']} — {lw['description'][:60]}" if lw else "нет"))
+    out.append(f"Тренировка сегодня по плану: {'да' if planned else 'нет'}"
+               + (f" ({why})" if why else "")
+               + (", записана" if db.workout_on(iso) else "")
+               + "; последняя: " + (f"{lw['day']} — {lw['description'][:60]}" if lw else "нет"))
+
+    marks = db.marks_for_day(iso)
+    if marks:
+        out.append("Отметки сегодня: " + ", ".join(m["kind"] for m in marks))
 
     notes = db.list_notes()
     if notes:
-        out.append("Заметки (соблюдай): " + "; ".join(f"#{n['id']} {n['text']}" for n in notes))
+        out.append("Заметки (соблюдай): " + "; ".join(
+            f"#{n['id']} " + (f"[{n['topic']}] " if n.get("topic") else "") + n["text"] for n in notes))
+
+    plans = db.list_plans(only_enabled=True)
+    if plans:
+        out.append("Регулярно шлёт сервис: " + "; ".join(f"#{p['id']} {p['at']} {p['title']}" for p in plans))
     rem = db.pending_reminders()
     if rem:
         out.append("Напоминания: " + "; ".join(f"#{r['id']} {r['at']} {r['text']}" for r in rem))
-    sent = [d for d in db.deliveries(day.isoformat()) if d["ok"]]
+    sent = [d for d in db.deliveries(iso) if d["ok"]]
     if sent:
         out.append("Сервис прислал сам: " + ", ".join(f"{d['ts'][11:16]} {d['kind']}" for d in sent))
     return "\n".join(out)
 
 
 @mcp.tool()
-def remember(note: str) -> str:
-    """Запомнить надолго просьбу или привычку человека. Возвращается в context. Вызывай, когда он
-    просит запомнить или меняет правила общения."""
-    db.add_note(note.strip())
-    return f"Запомнено: {note.strip()}"
+def remember(note: str, topic: str = "") -> str:
+    """Запомнить надолго просьбу или привычку. topic — короткий ключ темы (молитва, еда, сон):
+    новая заметка по той же теме заменяет прежнюю, иначе противоречия копятся и ты забываешь.
+    Указывай topic всегда. Регулярные напоминания заметкой не делаются — для них add_plan."""
+    db.add_note(note.strip(), topic)
+    return f"Запомнено ({topic.strip().lower() or 'без темы'}): {note.strip()}"
 
 
 @mcp.tool()
 def forget(note_id: int) -> str:
     """Удалить заметку по номеру из context."""
     return "Удалено." if db.delete_note(note_id) else f"Заметки #{note_id} нет."
-
-
-# ---------- вода ----------
-
-@mcp.tool()
-def log_water(ml: float) -> str:
-    """Записать воду в мл (стакан 250, бутылка 500)."""
-    db.add_water(ml)
-    s = db.get_settings()
-    return f"Вода: +{ml:.0f} мл, за сегодня {db.water_total():.0f} из {s.get('water_norm_ml')} мл."
-
-
-# ---------- картинки ----------
-
-@mcp.tool()
-async def send_image(url: str, caption: str = "") -> str:
-    """Прислать человеку картинку в Telegram по её адресу, чтобы она пришла изображением,
-    а не строкой со ссылкой. Вызывай сразу после того, как нарисовала картинку.
-    caption — одна короткая строка подписи."""
-    url = (url or "").strip()
-    if not url.startswith("http"):
-        return "Нужен полный адрес картинки, начинающийся с http."
-    started = time.monotonic()
-    ok = await telegram.send_photo(url, caption.strip())
-    took = f"{time.monotonic() - started:.1f} с"
-    db.log_delivery("картинка", ok, took if ok else f"Telegram не принял изображение ({took})")
-    return "Картинка отправлена." if ok else "Не удалось отправить картинку, попробуй ещё раз чуть позже."
-
-
-# ---------- разовые напоминания ----------
-
-def _parse_at(at: str, in_minutes: int) -> datetime | str:
-    now = db.now_local()
-    if in_minutes and in_minutes > 0:
-        return now + timedelta(minutes=in_minutes)
-    at = (at or "").strip().replace("T", " ")
-    for fmt in ("%Y-%m-%d %H:%M", "%d.%m.%Y %H:%M", "%d.%m %H:%M", "%H:%M"):
-        try:
-            p = datetime.strptime(at, fmt)
-        except ValueError:
-            continue
-        if fmt == "%H:%M":
-            t = now.replace(hour=p.hour, minute=p.minute, second=0, microsecond=0)
-            return t if t > now else t + timedelta(days=1)
-        if fmt == "%d.%m %H:%M":
-            p = p.replace(year=now.year)
-        return p.replace(tzinfo=now.tzinfo)
-    return "Не понял время. Нужно HH:MM, YYYY-MM-DD HH:MM или in_minutes."
-
-
-@mcp.tool()
-def remind_me(text: str, at: str = "", in_minutes: int = 0) -> str:
-    """Разовое напоминание: сервис пришлёт text в Telegram. at — «HH:MM» (сегодня, прошло — завтра)
-    или «YYYY-MM-DD HH:MM»; либо in_minutes."""
-    when = _parse_at(at, in_minutes)
-    if isinstance(when, str):
-        return when
-    if when <= db.now_local():
-        return "Это время уже прошло."
-    key = when.strftime("%Y-%m-%d %H:%M")
-    db.add_custom_reminder(key, text.strip())
-    return f"Напомню {when.strftime('%d.%m в %H:%M')}: {text.strip()}"
-
-
-@mcp.tool()
-def list_reminders() -> str:
-    """Запланированные разовые напоминания."""
-    rows = db.pending_reminders()
-    return "\n".join(f"#{r['id']} {r['at']} — {r['text']}" for r in rows) if rows else "Разовых напоминаний нет."
-
-
-@mcp.tool()
-def cancel_reminder(reminder_id: int) -> str:
-    """Отменить разовое напоминание по номеру."""
-    return "Отменено." if db.cancel_reminder(reminder_id) else f"Напоминания #{reminder_id} нет."

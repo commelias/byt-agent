@@ -36,6 +36,7 @@ DEFAULT_SETTINGS = {
     "workout_days": "mon,wed,fri",    # дни тренировок
     "workout_time": "08:00",          # напоминание о тренировке
     "workout_program": "",            # текст программы (свободная форма)
+    "workout_check_time": "20:30",    # вечерний вопрос о тренировке, если она в плане и не записана
     "calendar_time": "20:00",         # напоминание «завтра постный день»
     "abstinence_days": "",            # личный график, напр. "mon,wed,fri"; пусто — выключено
     "abstinence_time": "09:00",
