@@ -47,11 +47,15 @@ SCHEMA = [
         id {pk}, created TEXT NOT NULL, kind TEXT NOT NULL, text TEXT NOT NULL,
         sent INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0,
         next_try TEXT, error TEXT)""",
-    # повторяющиеся напоминания, заводятся агентом без правки кода
-    """CREATE TABLE IF NOT EXISTS plans (
-        id {pk}, created TEXT NOT NULL, title TEXT NOT NULL, at TEXT NOT NULL,
-        days TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '',
-        text_key TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1)""",
+    # события планировщика: и системные, и заведённые человеком — в одной таблице
+    """CREATE TABLE IF NOT EXISTS events (
+        id {pk}, created TEXT NOT NULL, ekey TEXT NOT NULL UNIQUE, title TEXT NOT NULL,
+        at TEXT NOT NULL DEFAULT '', days TEXT NOT NULL DEFAULT 'all',
+        cond TEXT NOT NULL DEFAULT '', param REAL NOT NULL DEFAULT 0,
+        doc_kind TEXT NOT NULL DEFAULT 'text', doc TEXT NOT NULL DEFAULT '',
+        mark TEXT NOT NULL DEFAULT '', repeat_hours REAL NOT NULL DEFAULT 0,
+        max_per_day INTEGER NOT NULL DEFAULT 1, system INTEGER NOT NULL DEFAULT 0,
+        enabled INTEGER NOT NULL DEFAULT 1)""",
     # длинные точные тексты (молитвенное правило и подобное) — шлются мимо модели
     """CREATE TABLE IF NOT EXISTS texts (
         key TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '',
@@ -140,6 +144,8 @@ def init():
             _run(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
     for k, v in config.DEFAULT_SETTINGS.items():
         _run("INSERT INTO settings(key, value) VALUES (?, ?) ON CONFLICT (key) DO NOTHING", (k, v))
+    for k in config.RETIRED_SETTINGS:
+        _run("DELETE FROM settings WHERE key = ?", (k,))
 
 
 def _columns(table: str) -> set[str]:
@@ -345,28 +351,56 @@ def delete_text(key: str) -> bool:
     return _run("DELETE FROM texts WHERE key = ?", (key,)) == 1
 
 
-# ---------- повторяющиеся напоминания ----------
+# ---------- события планировщика ----------
 
-def add_plan(title: str, at: str, days: str = "", body: str = "", text_key: str = "") -> int:
-    row = _one("""INSERT INTO plans(created, title, at, days, body, text_key, enabled)
-                  VALUES (?,?,?,?,?,?,1) RETURNING id""",
-               (_stamp(), title, at, days, body, text_key))
+EVENT_FIELDS = ("id", "ekey", "title", "at", "days", "cond", "param",
+                "doc_kind", "doc", "mark", "repeat_hours", "max_per_day", "system", "enabled")
+
+
+def add_event(ekey: str, title: str, at: str = "", days: str = "all", cond: str = "",
+              param: float = 0, doc_kind: str = "text", doc: str = "", mark: str = "",
+              repeat_hours: float = 0, max_per_day: int = 1, system: bool = False) -> int:
+    row = _one("""INSERT INTO events(created, ekey, title, at, days, cond, param, doc_kind, doc,
+                  mark, repeat_hours, max_per_day, system, enabled)
+                  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,1) RETURNING id""",
+               (_stamp(), ekey, title, at, days, cond, param, doc_kind, doc, mark,
+                repeat_hours, max_per_day, 1 if system else 0))
     return int(row["id"])
 
 
-def list_plans(only_enabled: bool = False):
-    sql = "SELECT id, title, at, days, body, text_key, enabled FROM plans"
+def seed_event(**kw) -> bool:
+    """Системное событие заводится один раз; потом его время и дни принадлежат человеку."""
+    if _one("SELECT id FROM events WHERE ekey = ?", (kw["ekey"],)):
+        return False
+    add_event(**kw)
+    return True
+
+
+def list_events(only_enabled: bool = False):
+    sql = "SELECT " + ", ".join(EVENT_FIELDS) + " FROM events"
     if only_enabled:
         sql += " WHERE enabled = 1"
     return _all(sql + " ORDER BY at, id")
 
 
-def set_plan_enabled(plan_id: int, on: bool) -> bool:
-    return _run("UPDATE plans SET enabled = ? WHERE id = ?", (1 if on else 0, plan_id)) == 1
+def get_event(ref: str):
+    """По номеру или по ключу — человеку удобнее номер, коду ключ."""
+    sql = "SELECT " + ", ".join(EVENT_FIELDS) + " FROM events WHERE "
+    if str(ref).isdigit():
+        return _one(sql + "id = ?", (int(ref),))
+    return _one(sql + "ekey = ?", (str(ref).strip().lower(),))
 
 
-def delete_plan(plan_id: int) -> bool:
-    return _run("DELETE FROM plans WHERE id = ?", (plan_id,)) == 1
+def update_event(eid: int, **fields) -> bool:
+    allowed = {k: v for k, v in fields.items() if k in EVENT_FIELDS and k not in ("id", "ekey", "system")}
+    if not allowed:
+        return False
+    sets = ", ".join(f"{k} = ?" for k in allowed)
+    return _run(f"UPDATE events SET {sets} WHERE id = ?", (*allowed.values(), eid)) >= 1
+
+
+def delete_event(eid: int) -> bool:
+    return _run("DELETE FROM events WHERE id = ? AND system = 0", (eid,)) == 1
 
 
 # ---------- разовые напоминания ----------

@@ -1,9 +1,13 @@
-"""Часы: раз в минуту смотрим расписание и складываем в очередь то, что подошло по времени.
+"""Часы: раз в минуту проходим по событиям и складываем в очередь то, что подошло.
 
-Отправкой занимается один воркер (flush) — у него единственная логика повторов на весь сервис.
-Раньше «повторить, если не ушло» было написано трижды и по-разному.
-reminders_sent гарантирует, что плановое уходит один раз в день; delivery_log — журнал того,
-что сервис прислал сам (его видит агент в context).
+Событие — единица планировщика, и системные, и заведённые человеком лежат в одной таблице.
+У события четыре стрелки:
+    КОГДА      — at, days, repeat_hours, max_per_day
+    УСЛОВИЕ    — cond и param: пусто (просто по времени) либо имя из реестра CONDITIONS
+    ДОКУМЕНТ   — doc_kind: text (текст в событии), saved (точный текст из texts), calc (обработчик)
+    ОТМЕТКА    — mark: что записать в журнал, когда человек ответит
+
+Отправкой и повторами занимается один воркер (flush) — единственная логика повторов на весь сервис.
 """
 import logging
 from datetime import datetime, timedelta
@@ -14,14 +18,41 @@ from . import agent, config, db, orthodox, telegram
 
 log = logging.getLogger("byt.scheduler")
 
-MAX_ATTEMPTS = 5          # после этого сообщение помечается несостоявшимся и видно в /diag
-BATCH = 6                 # сколько сообщений отправляем за один тик
+MAX_ATTEMPTS = 5   # после этого сообщение помечается несостоявшимся и видно в /diag
+BATCH = 6          # сколько сообщений отправляем за один тик
 
-KIND = {"summary": "итог дня", "workout": "тренировка", "calendar": "календарь",
-        "abstinence": "личный график", "nudge_meal": "вопрос о еде",
-        "nudge_water": "вопрос о воде", "custom": "разовое напоминание",
-        "workout_check": "вопрос о тренировке", "plan": "напоминание"}
+MEAL_TEXT = ("Давно не было записей о еде. Всё в порядке? Если ел — напиши, что было, я запишу. "
+             "Если некогда — просто перекуси, это важнее записи.")
+WATER_TEXT = "Давно не было отметок о воде. Выпей стакан и напиши сколько — я запишу."
 
+# Системные события. Заводятся один раз при первом старте; дальше время и дни принадлежат человеку.
+SYSTEM_EVENTS = [
+    dict(ekey="summary", title="Итог дня", at="21:00", doc_kind="calc", doc="summary"),
+    dict(ekey="workout", title="Тренировка утром", at="08:00", cond="workout_planned",
+         doc_kind="calc", doc="workout"),
+    dict(ekey="workout_check", title="Вечерний вопрос о тренировке", at="20:30",
+         cond="workout_unlogged", doc_kind="calc", doc="workout_check", mark="тренировка"),
+    dict(ekey="calendar", title="Завтра постный день", at="20:00", cond="fast_tomorrow",
+         doc_kind="calc", doc="calendar"),
+    dict(ekey="abstinence", title="Личный график", at="09:00", days="", doc_kind="calc",
+         doc="abstinence", enabled=False),
+    dict(ekey="meal_check", title="Вопрос о еде", cond="no_meals", param=5,
+         doc_kind="text", doc=MEAL_TEXT, mark="еда", repeat_hours=5, max_per_day=2),
+    dict(ekey="water_check", title="Вопрос о воде", cond="no_water", param=3,
+         doc_kind="text", doc=WATER_TEXT, mark="вода", repeat_hours=3, max_per_day=3),
+]
+
+
+def seed():
+    for e in SYSTEM_EVENTS:
+        spec = dict(e, system=True)
+        enabled = spec.pop("enabled", True)
+        if db.seed_event(**spec) and not enabled:
+            row = db.get_event(spec["ekey"])
+            db.update_event(row["id"], enabled=0)
+
+
+# ---------- когда ----------
 
 def _days(value: str) -> set[int]:
     return {db.DAY_CODES.index(x) for x in value.replace(" ", "").lower().split(",") if x in db.DAY_CODES}
@@ -36,8 +67,8 @@ def _hm(hhmm: str):
 
 
 def _due(now: datetime, hhmm: str, window: int = 120) -> bool:
-    """Время наступило, но прошло не больше окна (догоняем после простоя, но не вываливаем
-    все напоминания разом после позднего развёртывания)."""
+    """Время наступило, но прошло не больше окна: догоняем после простоя, но не вываливаем
+    всё разом после позднего развёртывания."""
     hm = _hm(hhmm)
     if not hm:
         return False
@@ -50,9 +81,66 @@ def _at_today(now: datetime, hhmm: str, default: str) -> datetime:
     return now.replace(hour=h, minute=m, second=0, microsecond=0)
 
 
-# ---------- что именно сказать ----------
+def _awake(now: datetime, s: dict) -> bool:
+    """Час после подъёма и час до отбоя — тишина."""
+    wake = _at_today(now, s.get("wake_time", ""), "08:00")
+    sleep = _at_today(now, s.get("sleep_time", ""), "23:00")
+    return wake + timedelta(hours=1) <= now <= sleep - timedelta(hours=1)
 
-async def evening_summary(now: datetime, s: dict) -> str:
+
+# ---------- условия ----------
+
+def _quiet_since(now: datetime, table: str, ekey: str, s: dict) -> float:
+    """Сколько часов нет записей — с оглядкой на то, когда мы спрашивали в прошлый раз."""
+    since = db.last_ts(table) or _at_today(now, s.get("wake_time", ""), "08:00")
+    asked = db.get_state(ekey)
+    if asked:
+        since = max(since, datetime.fromisoformat(asked))
+    return (now - since).total_seconds() / 3600
+
+
+def _cond(name: str, ev: dict, now: datetime, s: dict) -> bool:
+    day = now.date().isoformat()
+    if not name:
+        return True
+    if name == "workout_planned":
+        return db.workout_planned(day, s.get("workout_days", ""))[0]
+    if name == "workout_unlogged":
+        return db.workout_planned(day, s.get("workout_days", ""))[0] and not db.workout_on(day)
+    if name == "fast_tomorrow":
+        info = orthodox.describe(now.date() + timedelta(days=1))
+        return bool(info["fast"] or info["feast"])
+    if name == "no_meals":
+        strict = (orthodox.describe(now.date())["fast_reason"] or "").startswith("строгий")
+        return not strict and _awake(now, s) and _quiet_since(now, "meals", ev["ekey"], s) >= ev["param"]
+    if name == "no_water":
+        return _awake(now, s) and _quiet_since(now, "water", ev["ekey"], s) >= ev["param"]
+    log.error("Событие %s ссылается на неизвестное условие «%s»", ev["ekey"], name)
+    return False
+
+
+# ---------- документы ----------
+
+async def _calc(name: str, now: datetime, s: dict) -> str | None:
+    if name == "summary":
+        return await _summary(now, s)
+    if name == "workout":
+        _, why = db.workout_planned(now.date().isoformat(), s.get("workout_days", ""))
+        head = f"Сегодня тренировка ({why})." if why else "Сегодня тренировка по плану."
+        program = s.get("workout_program", "").strip()
+        return head + (f"\n{program}" if program else "")
+    if name == "workout_check":
+        _, why = db.workout_planned(now.date().isoformat(), s.get("workout_days", ""))
+        return f"Тренировка на сегодня в плане{f' ({why})' if why else ''}, а записи нет. Была? Как колено?"
+    if name == "calendar":
+        return "Завтра — " + orthodox.human(now.date() + timedelta(days=1))
+    if name == "abstinence":
+        return s.get("abstinence_text") or "Сегодня день по графику."
+    log.error("Неизвестный обработчик документа «%s»", name)
+    return None
+
+
+async def _summary(now: datetime, s: dict) -> str:
     day = now.date().isoformat()
     totals = db.day_totals(day)
     meals = db.meals_for_day(day)
@@ -68,134 +156,67 @@ async def evening_summary(now: datetime, s: dict) -> str:
     return await agent.ask(prompt) or f"{plain}\n{detail}"
 
 
-async def workout_reminder(now: datetime, s: dict) -> str | None:
-    planned, why = db.workout_planned(now.date().isoformat(), s.get("workout_days", ""))
-    if not planned:
-        return None
-    head = "Сегодня тренировка по плану." if not why else f"Сегодня тренировка ({why})."
-    program = s.get("workout_program", "").strip()
-    return head + (f"\n{program}" if program else "")
+async def _document(ev: dict, now: datetime, s: dict) -> str | None:
+    kind = ev["doc_kind"]
+    if kind == "text":
+        return ev["doc"].strip() or None
+    if kind == "saved":
+        saved = db.get_text(ev["doc"])
+        if not saved:
+            log.error("Событие %s ссылается на текст «%s», которого нет", ev["ekey"], ev["doc"])
+            return None
+        title = (saved["title"] or ev["title"]).strip()
+        return (f"{title}\n\n" if title else "") + saved["body"]
+    if kind == "calc":
+        return await _calc(ev["doc"], now, s)
+    log.error("Событие %s: неизвестный вид документа «%s»", ev["ekey"], kind)
+    return None
 
 
-async def calendar_reminder(now: datetime, s: dict) -> str | None:
-    tomorrow = now.date() + timedelta(days=1)
-    info = orthodox.describe(tomorrow)
-    if not (info["fast"] or info["feast"]):
-        return None
-    return "Завтра — " + orthodox.human(tomorrow)
+# ---------- проход по событиям ----------
 
-
-async def abstinence_reminder(now: datetime, s: dict) -> str:
-    return s.get("abstinence_text") or "Сегодня день по графику."
-
-
-async def workout_check(now: datetime, s: dict) -> str | None:
-    """Вечером спросить о тренировке, если она была запланирована на сегодня и не записана.
-    Смотрит исключения, поэтому перенос на выходной не теряется."""
+async def events(now: datetime, s: dict):
     day = now.date().isoformat()
-    planned, why = db.workout_planned(day, s.get("workout_days", ""))
-    if not planned or db.workout_on(day):
-        return None
-    hint = f" (перенос: {why})" if why else ""
-    return f"Тренировка на сегодня в плане{hint}, а записи нет. Была? Как колено?"
-
-
-# ---------- плановые ----------
-
-async def planned(now: datetime, s: dict):
-    day = now.date().isoformat()
-    wd = now.weekday()
-    checks = [
-        ("summary", s.get("summary_time", ""), True, evening_summary),
-        ("workout", s.get("workout_time", ""), True, workout_reminder),
-        ("calendar", s.get("calendar_time", ""), True, calendar_reminder),
-        ("abstinence", s.get("abstinence_time", ""), wd in _days(s.get("abstinence_days", "")), abstinence_reminder),
-        ("workout_check", s.get("workout_check_time", ""), True, workout_check),
-    ]
-    for kind, hhmm, applies, handler in checks:
-        if not applies or not _due(now, hhmm) or not db.reminder_claim(day, kind):
-            continue
+    for ev in db.list_events(only_enabled=True):
         try:
-            text = await handler(now, s)
-            if text:
-                db.enqueue(KIND[kind], text)
-        except Exception as e:  # noqa: BLE001
-            log.error("Ошибка напоминания %s: %s: %s", kind, type(e).__name__, e)
-
-
-async def user_plans(now: datetime):
-    """Повторяющиеся напоминания, заведённые агентом: текстом или ссылкой на точный текст."""
-    day = now.date().isoformat()
-    for p in db.list_plans(only_enabled=True):
-        days = (p["days"] or "").strip()
-        if days and days != "all" and now.weekday() not in _days(days):
-            continue
-        if not _due(now, p["at"]) or not db.reminder_claim(day, f"plan{p['id']}"):
-            continue
-        body = (p["body"] or "").strip()
-        if p["text_key"]:
-            saved = db.get_text(p["text_key"])
-            if not saved:
-                log.error("План #%s ссылается на текст «%s», которого нет", p["id"], p["text_key"])
+            days = (ev["days"] or "").strip()
+            if days and days != "all" and now.weekday() not in _days(days):
                 continue
-            title = (saved["title"] or p["title"]).strip()
-            body = (f"{title}\n\n" if title else "") + saved["body"]
-        if body:
-            db.enqueue(KIND["plan"], body)
+            repeating = float(ev["repeat_hours"] or 0) > 0
+            if repeating:
+                if db.count_deliveries(day, ev["title"]) >= int(ev["max_per_day"]):
+                    continue
+            elif not _due(now, ev["at"]):
+                continue
+            if not _cond(ev["cond"], ev, now, s):
+                continue
+            if not repeating and not db.reminder_claim(day, "ev:" + ev["ekey"]):
+                continue
+            text = await _document(ev, now, s)
+            if not text:
+                continue
+            db.enqueue(ev["title"], text)
+            if repeating:
+                db.set_state(ev["ekey"], now.isoformat(timespec="minutes"))
+            if ev["mark"]:
+                db.set_state("ждёт:" + ev["mark"], day)
+        except Exception as e:  # noqa: BLE001
+            log.error("Событие %s сорвалось: %s: %s", ev["ekey"], type(e).__name__, e)
 
-
-# ---------- разовые ----------
 
 async def custom(now: datetime):
+    """Разовые напоминания живут отдельно: у них нет ни условия, ни документа — только время."""
     stamp = now.strftime("%Y-%m-%d %H:%M")
     for r in db.pending_reminders():
         if r["at"] > stamp:
             break  # список отсортирован по времени
-        db.enqueue(KIND["custom"], "Напоминание: " + r["text"])
+        db.enqueue("разовое напоминание", "Напоминание: " + r["text"])
         db.mark_reminder_sent(r["id"])
-
-
-# ---------- забота: давно нет записей ----------
-
-MEAL_TEXT = ("Давно не было записей о еде. Всё в порядке? Если ел — напиши, что было, я запишу. "
-             "Если некогда — просто перекуси, это важнее записи.")
-WATER_TEXT = "Давно не было отметок о воде. Выпей стакан и напиши сколько — я запишу."
-
-
-async def nudges(now: datetime, s: dict):
-    wake = _at_today(now, s.get("wake_time", ""), "08:00")
-    sleep = _at_today(now, s.get("sleep_time", ""), "23:00")
-    if not (wake + timedelta(hours=1) <= now <= sleep - timedelta(hours=1)):
-        return  # до подъёма, сразу после, перед сном и ночью не беспокоим
-    day = now.date().isoformat()
-    strict = (orthodox.describe(now.date())["fast_reason"] or "").startswith("строгий")
-
-    for kind, table, hours_key, cap, text, skip in (
-        ("nudge_meal", "meals", "checkin_meal_hours", 2, MEAL_TEXT, strict),
-        ("nudge_water", "water", "checkin_water_hours", 3, WATER_TEXT, False),
-    ):
-        try:
-            hours = float(s.get(hours_key) or 0)
-        except ValueError:
-            hours = 0
-        if hours <= 0 or skip:
-            continue
-        since = db.last_ts(table) or wake
-        last_nudge = db.get_state(kind)
-        if last_nudge:
-            since = max(since, datetime.fromisoformat(last_nudge))
-        if now - since < timedelta(hours=hours):
-            continue
-        if db.count_deliveries(day, KIND[kind]) >= cap:
-            continue
-        db.enqueue(KIND[kind], text)
-        db.set_state(kind, now.isoformat(timespec="minutes"))
 
 
 # ---------- единственный отправщик ----------
 
 async def flush(now: datetime):
-    """Забрать очередь и отправить. Здесь же повторы: сеть до Telegram моргает регулярно."""
     for item in db.outbox_pending(limit=BATCH):
         ok = False
         try:
@@ -218,7 +239,7 @@ async def flush(now: datetime):
 async def tick():
     now = db.now_local()
     s = db.get_settings()
-    for step in (planned(now, s), user_plans(now), custom(now), nudges(now, s), flush(now)):
+    for step in (events(now, s), custom(now), flush(now)):
         try:
             await step
         except Exception as e:  # noqa: BLE001
@@ -226,6 +247,7 @@ async def tick():
 
 
 def start() -> AsyncIOScheduler:
+    seed()
     sched = AsyncIOScheduler(timezone=config.TZ)
     sched.add_job(tick, "interval", minutes=1, id="tick", max_instances=1, coalesce=True)
     sched.start()

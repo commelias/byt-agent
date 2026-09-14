@@ -32,20 +32,15 @@ DEFAULT_SETTINGS = {
     "norm_protein": "120",
     "norm_fat": "70",
     "norm_carbs": "220",
-    "summary_time": "21:00",          # вечерний итог по питанию
-    "workout_days": "mon,wed,fri",    # дни тренировок
-    "workout_time": "08:00",          # напоминание о тренировке
+    "workout_days": "mon,wed,fri",    # базовые дни тренировок; переносы — в workout_exceptions
     "workout_program": "",            # текст программы (свободная форма)
-    "workout_check_time": "20:30",    # вечерний вопрос о тренировке, если она в плане и не записана
-    "calendar_time": "20:00",         # напоминание «завтра постный день»
-    "abstinence_days": "",            # личный график, напр. "mon,wed,fri"; пусто — выключено
-    "abstinence_time": "09:00",
     "abstinence_text": "Сегодня день по графику.",
     # режим дня: вне этого окна сервис сам не беспокоит
     "wake_time": "08:00",
     "sleep_time": "23:00",
-    # забота: через сколько часов без записей спросить (0 — не спрашивать)
-    "checkin_meal_hours": "5",
-    "checkin_water_hours": "3",
     "water_norm_ml": "2000",
 }
+
+# Времена и частота переехали в таблицу событий: одно место вместо двух.
+RETIRED_SETTINGS = ("summary_time", "workout_time", "workout_check_time", "calendar_time",
+                    "abstinence_days", "abstinence_time", "checkin_meal_hours", "checkin_water_hours")

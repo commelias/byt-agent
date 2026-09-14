@@ -211,38 +211,93 @@ def send_saved_text(key: str) -> str:
     return "Отправила."
 
 
-# ---------- повторяющиеся напоминания ----------
+# ---------- события планировщика ----------
+
+MARKS = ("тренировка", "еда", "вода")
+
 
 @mcp.tool()
-def add_plan(title: str, at: str, days: str = "all", text: str = "", text_key: str = "") -> str:
-    """Повторяющееся напоминание: title — название, at — время HH:MM, days — all или mon,wed,fri.
-    text — что прислать, либо text_key — ключ сохранённого текста. Заводи, когда человек просит
-    напоминать регулярно: заметка о такой просьбе не работает, напоминание шлёт только сервис."""
+def list_events() -> str:
+    """Все события планировщика: что и когда сервис присылает сам. Системные не удаляются,
+    но им можно менять время и дни и выключать их."""
+    rows = db.list_events()
+    if not rows:
+        return "Событий нет."
+    out = []
+    for r in rows:
+        when = r["at"] or (f"каждые {r['param']:.0f} ч" if r["repeat_hours"] else "—")
+        line = f"#{r['id']} {when} {r['days'] or 'all'} — {r['title']}"
+        if r["doc_kind"] == "saved":
+            line += f" [текст: {r['doc']}]"
+        if r["cond"]:
+            line += f" [если: {r['cond']}]"
+        if not r["enabled"]:
+            line += " (выключено)"
+        if r["system"]:
+            line += " ·сист"
+        out.append(line)
+    return "\n".join(out)
+
+
+@mcp.tool()
+def add_event(title: str, at: str, days: str = "all", text: str = "",
+              text_key: str = "", mark: str = "") -> str:
+    """Завести повторяющееся событие: title — название, at — время HH:MM, days — all или mon,wed,fri.
+    Что прислать: text (короткий текст) либо text_key (ключ сохранённого точного текста).
+    mark — что потом отметить в журнале, например «правило». Просит напоминать регулярно —
+    только так: заметка ничего не пришлёт, присылает сервис."""
     if not _hm_ok(at):
         return "Время нужно в виде HH:MM."
     if not text and not text_key:
         return "Нужен text или text_key."
     if text_key and not db.get_text(text_key.strip().lower()):
         return f"Текста «{text_key}» нет — сначала сохрани его через saved_text."
-    pid = db.add_plan(title.strip(), at.strip(), days.strip().lower(), text.strip(), text_key.strip().lower())
-    return f"Напоминание #{pid} «{title.strip()}» в {at.strip()}, дни: {days.strip().lower()}."
+    ekey = "u" + db.now_local().strftime("%m%d%H%M%S")
+    eid = db.add_event(ekey=ekey, title=title.strip(), at=at.strip(), days=days.strip().lower(),
+                       doc_kind="saved" if text_key else "text",
+                       doc=(text_key.strip().lower() if text_key else text.strip()),
+                       mark=mark.strip().lower())
+    return f"Событие #{eid} «{title.strip()}» в {at.strip()}, дни: {days.strip().lower()}."
 
 
 @mcp.tool()
-def list_plans() -> str:
-    """Повторяющиеся напоминания сервиса."""
-    rows = db.list_plans()
-    if not rows:
-        return "Повторяющихся напоминаний нет."
-    return "\n".join(f"#{r['id']} {r['at']} {r['days'] or 'all'} — {r['title']}"
-                     + (f" [текст: {r['text_key']}]" if r["text_key"] else "")
-                     + ("" if r["enabled"] else " (выключено)") for r in rows)
+def edit_event(event: str, at: str = "", days: str = "", on: str = "", text: str = "") -> str:
+    """Поменять событие по номеру: at — новое время HH:MM, days — all или mon,wed,fri,
+    on — «да»/«нет» (включить или выключить), text — новый текст. Так же меняется
+    и время системных напоминаний."""
+    row = db.get_event(event)
+    if not row:
+        return f"События {event} нет."
+    fields = {}
+    if at:
+        if not _hm_ok(at):
+            return "Время нужно в виде HH:MM."
+        fields["at"] = at.strip()
+    if days:
+        fields["days"] = days.strip().lower()
+    if on:
+        fields["enabled"] = 1 if on.strip().lower() in ("да", "вкл", "yes", "on", "1") else 0
+    if text:
+        if row["doc_kind"] != "text":
+            return "У этого события документ не текстовый — меняй его через saved_text."
+        fields["doc"] = text.strip()
+    if not fields:
+        return "Нечего менять."
+    db.update_event(row["id"], **fields)
+    r = db.get_event(row["id"])
+    return (f"#{r['id']} «{r['title']}»: {r['at'] or 'по условию'}, дни {r['days'] or 'all'}"
+            + ("" if r["enabled"] else ", выключено"))
 
 
 @mcp.tool()
-def remove_plan(plan_id: int) -> str:
-    """Убрать повторяющееся напоминание по номеру."""
-    return "Убрано." if db.delete_plan(plan_id) else f"Напоминания #{plan_id} нет."
+def remove_event(event: str) -> str:
+    """Убрать событие по номеру. Системные не удаляются — их можно только выключить через edit_event."""
+    row = db.get_event(event)
+    if not row:
+        return f"События {event} нет."
+    if row["system"]:
+        return f"«{row['title']}» — системное событие, его можно только выключить: edit_event с on=нет."
+    return "Убрано." if db.delete_event(row["id"]) else "Не получилось убрать."
 
 
 # ---------- разовые напоминания ----------
@@ -277,7 +332,7 @@ def _parse_at(at: str, in_minutes: int) -> datetime | str:
 @mcp.tool()
 def remind_me(text: str, at: str = "", in_minutes: int = 0) -> str:
     """Разовое напоминание: сервис пришлёт text в Telegram. at — «HH:MM» (сегодня, прошло — завтра)
-    или «YYYY-MM-DD HH:MM»; либо in_minutes. Регулярное — не сюда, а в add_plan."""
+    или «YYYY-MM-DD HH:MM»; либо in_minutes. Регулярное — не сюда, а в add_event."""
     when = _parse_at(at, in_minutes)
     if isinstance(when, str):
         return when
@@ -312,9 +367,8 @@ def get_settings() -> str:
 @mcp.tool()
 def set_setting(key: str, value: str) -> str:
     """Изменить настройку. Ключи: norm_kcal, norm_protein, norm_fat, norm_carbs, water_norm_ml,
-    summary_time, workout_days (mon..sun), workout_time, workout_check_time, workout_program,
-    calendar_time, abstinence_days/_time/_text, wake_time, sleep_time, checkin_meal_hours,
-    checkin_water_hours (часы без записей до вопроса, 0 — молчать). Время в HH:MM."""
+    workout_days (mon..sun), workout_program, abstinence_text, wake_time, sleep_time.
+    Время напоминаний здесь не живёт — оно в событиях, меняй через edit_event."""
     if key not in config.DEFAULT_SETTINGS:
         return f"Неизвестный ключ {key}. Допустимые: {', '.join(config.DEFAULT_SETTINGS)}"
     db.set_setting(key, value.strip())
@@ -334,6 +388,25 @@ def _part_of_day(h: int) -> str:
     if 17 <= h < 22:
         return "вечер"
     return "ночь"
+
+
+def _pending_marks(day: str) -> list[str]:
+    """О чём сервис сегодня спросил и ответа ещё нет. Без этого вопрос уходит в пустоту:
+    бот спросил, человек ответил, а записывать оказалось нечем."""
+    done = {"тренировка": bool(db.workout_on(day)),
+            "еда": db.day_totals(day)["count"] > 0,
+            "вода": db.water_total(day) > 0}
+    kinds = {m["kind"] for m in db.marks_for_day(day)}
+    out = []
+    for ev in db.list_events(only_enabled=True):
+        mark = (ev["mark"] or "").strip()
+        if not mark or db.get_state("ждёт:" + mark) != day:
+            continue
+        if done.get(mark, any(k.startswith(mark) for k in kinds)):
+            continue
+        if mark not in out:
+            out.append(mark)
+    return out
 
 
 @mcp.tool()
@@ -373,9 +446,12 @@ def context() -> str:
         out.append("Заметки (соблюдай): " + "; ".join(
             f"#{n['id']} " + (f"[{n['topic']}] " if n.get("topic") else "") + n["text"] for n in notes))
 
-    plans = db.list_plans(only_enabled=True)
-    if plans:
-        out.append("Регулярно шлёт сервис: " + "; ".join(f"#{p['id']} {p['at']} {p['title']}" for p in plans))
+    evs = [e for e in db.list_events(only_enabled=True) if e["at"]]
+    if evs:
+        out.append("Сервис присылает сам: " + "; ".join(f"#{e['id']} {e['at']} {e['title']}" for e in evs))
+    waiting = _pending_marks(iso)
+    if waiting:
+        out.append("Спросил и ждёт ответа: " + ", ".join(waiting) + " — получишь ответ, сразу запиши")
     rem = db.pending_reminders()
     if rem:
         out.append("Напоминания: " + "; ".join(f"#{r['id']} {r['at']} {r['text']}" for r in rem))
@@ -389,7 +465,7 @@ def context() -> str:
 def remember(note: str, topic: str = "") -> str:
     """Запомнить надолго просьбу или привычку. topic — короткий ключ темы (молитва, еда, сон):
     новая заметка по той же теме заменяет прежнюю, иначе противоречия копятся и ты забываешь.
-    Указывай topic всегда. Регулярные напоминания заметкой не делаются — для них add_plan."""
+    Указывай topic всегда. Регулярные напоминания заметкой не делаются — для них add_event."""
     db.add_note(note.strip(), topic)
     return f"Запомнено ({topic.strip().lower() or 'без темы'}): {note.strip()}"
 
