@@ -41,8 +41,16 @@ async def diag(request: Request):
         return PlainTextResponse("unauthorized", status_code=401)
     lines = [await telegram.diagnose(), "", "Последние доставки:"]
     lines += [f"{d['ts']} {d['kind']} {'ok' if d['ok'] else 'СБОЙ'} {d['detail'] or ''}" for d in db.deliveries(limit=20)]
+    lines += ["", "Очередь исходящих:"]
+    lines += [f"#{o['id']} {o['kind']} попыток {o['attempts']}: {o['text'][:60]}" for o in db.outbox_pending(limit=20)] or ["пусто"]
+    stuck = db.outbox_stuck()
+    if stuck:
+        lines += ["", "НЕ ДОСТАВЛЕНО:"]
+        lines += [f"#{o['id']} {o['created']} {o['kind']}: {o['error']}" for o in stuck]
     lines += ["", "Разовые напоминания в очереди:"]
     lines += [f"#{r['id']} {r['at']} {r['text']}" for r in db.pending_reminders()] or ["нет"]
+    lines += ["", "Повторяющиеся напоминания:"]
+    lines += [f"#{p['id']} {p['at']} {p['days'] or 'all'} {p['title']}" for p in db.list_plans()] or ["нет"]
     return PlainTextResponse("\n".join(lines))
 
 
