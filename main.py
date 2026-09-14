@@ -49,8 +49,9 @@ async def diag(request: Request):
         lines += [f"#{o['id']} {o['created']} {o['kind']}: {o['error']}" for o in stuck]
     lines += ["", "Разовые напоминания в очереди:"]
     lines += [f"#{r['id']} {r['at']} {r['text']}" for r in db.pending_reminders()] or ["нет"]
-    lines += ["", "Повторяющиеся напоминания:"]
-    lines += [f"#{p['id']} {p['at']} {p['days'] or 'all'} {p['title']}" for p in db.list_plans()] or ["нет"]
+    lines += ["", "События планировщика:"]
+    lines += [f"#{e['id']} {e['at'] or 'по условию'} {e['days'] or 'all'} {e['title']}"
+              + ("" if e["enabled"] else " (выкл)") for e in db.list_events()] or ["нет"]
     return PlainTextResponse("\n".join(lines))
 
 
