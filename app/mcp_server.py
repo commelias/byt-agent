@@ -1,4 +1,5 @@
 """MCP-сервер «Журнал» — руки агента: записать, прочитать, настроить, напомнить."""
+import re
 from datetime import date, datetime, timedelta
 
 from mcp.server.fastmcp import FastMCP
@@ -257,7 +258,17 @@ def add_event(title: str, at: str, days: str = "all", text: str = "",
                        doc_kind="saved" if text_key else "text",
                        doc=(text_key.strip().lower() if text_key else text.strip()),
                        mark=mark.strip().lower())
-    return f"Событие #{eid} «{title.strip()}» в {at.strip()}, дни: {days.strip().lower()}."
+    now = db.now_local()
+    first = _first_run(now, at.strip(), days.strip().lower())
+    if first.date() == now.date():
+        when = "сегодня"
+    else:
+        # Время на сегодня уже прошло: забираем сегодняшний запуск, чтобы планировщик
+        # не прислал событие через минуту «вдогонку» в окне догона.
+        db.reminder_claim(now.date().isoformat(), "ev:" + ekey)
+        when = "завтра" if first.date() == now.date() + timedelta(days=1) else first.strftime("%d.%m")
+    return (f"Событие #{eid} «{title.strip()}» в {at.strip()}, дни: {days.strip().lower()}. "
+            f"Первый раз придёт {when} в {first.strftime('%H:%M')}.")
 
 
 @mcp.tool()
@@ -301,6 +312,33 @@ def remove_event(event: str) -> str:
 
 
 # ---------- разовые напоминания ----------
+
+_TIME_RE = re.compile(r"\b\d{1,2}:\d{2}\b")
+_REMIND_WORDS = ("напомина", "напомни", "каждое утро", "каждый вечер", "каждый день",
+                 "по утрам", "по вечерам", "ежедневно")
+_DAY_KEYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+
+def _looks_like_reminder(text: str) -> bool:
+    """Заметка с временем или словом «напоминай» — это событие, а не память: заметка не присылает."""
+    t = (text or "").lower()
+    return bool(_TIME_RE.search(t)) or any(w in t for w in _REMIND_WORDS)
+
+
+def _first_run(now: datetime, hhmm: str, days: str) -> datetime:
+    """Когда событие сработает впервые: сегодня, если время не прошло и день подходит, иначе ближайший день."""
+    h, m = map(int, hhmm.split(":"))
+    allowed = None
+    if days and days != "all":
+        allowed = {_DAY_KEYS.index(d.strip()) for d in days.split(",") if d.strip() in _DAY_KEYS}
+    for shift in range(8):
+        cand = (now + timedelta(days=shift)).replace(hour=h, minute=m, second=0, microsecond=0)
+        if allowed is not None and cand.weekday() not in allowed:
+            continue
+        if cand > now:
+            return cand
+    return now
+
 
 def _hm_ok(hhmm: str) -> bool:
     try:
@@ -447,6 +485,13 @@ def context() -> str:
             f"#{n['id']} " + (f"[{n['topic']}] " if n.get("topic") else "") + n["text"] for n in notes))
 
     evs = [e for e in db.list_events(only_enabled=True) if e["at"]]
+    if notes:
+        times = {e["at"] for e in evs}
+        orphans = [f"#{n['id']}" for n in notes
+                   if _TIME_RE.search(n["text"]) and not any(t in n["text"] for t in times)]
+        if orphans:
+            out.append("ВНИМАНИЕ: заметки " + ", ".join(orphans)
+                       + " обещают напоминание, а события нет — заведи add_event и удали заметку")
     if evs:
         out.append("Сервис присылает сам: " + "; ".join(f"#{e['id']} {e['at']} {e['title']}" for e in evs))
     waiting = _pending_marks(iso)
@@ -465,7 +510,11 @@ def context() -> str:
 def remember(note: str, topic: str = "") -> str:
     """Запомнить надолго просьбу или привычку. topic — короткий ключ темы (молитва, еда, сон):
     новая заметка по той же теме заменяет прежнюю, иначе противоречия копятся и ты забываешь.
-    Указывай topic всегда. Регулярные напоминания заметкой не делаются — для них add_event."""
+    Указывай topic всегда. Тексты с временем ЧЧ:ММ или словом «напоминай» отвергаются — это add_event."""
+    if not (topic or "").strip().lower().startswith("факт") and _looks_like_reminder(note):
+        return ("Это напоминание, а не заметка — заметка ничего не пришлёт. Регулярно — "
+                "add_event(title, at, text или text_key), разово — remind_me. Заведи событие "
+                "и назови человеку время первого срабатывания.")
     db.add_note(note.strip(), topic)
     return f"Запомнено ({topic.strip().lower() or 'без темы'}): {note.strip()}"
 
