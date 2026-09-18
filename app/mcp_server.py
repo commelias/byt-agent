@@ -209,7 +209,7 @@ def send_saved_text(key: str) -> str:
         return f"Текста «{key}» нет."
     title = (saved["title"] or "").strip()
     db.enqueue("сохранённый текст", (f"{title}\n\n" if title else "") + saved["body"])
-    return "Отправила."
+    return "Отправила. Если Telegram не пропустит, текст появится в context — тогда передай его сам."
 
 
 # ---------- события планировщика ----------
@@ -503,6 +503,15 @@ def context() -> str:
     sent = [d for d in db.deliveries(iso) if d["ok"]]
     if sent:
         out.append("Сервис прислал сам: " + ", ".join(f"{d['ts'][11:16]} {d['kind']}" for d in sent))
+    lost = db.outbox_undelivered()
+    if lost:
+        out.append("НЕ ДОШЛО ДО ЖЕНИ (Telegram не пропустил сообщения сервиса). В начале ответа "
+                   "одной фразой скажи, что не дошло, и передай содержание; устаревшее по времени "
+                   "(вопрос о еде или воде, если он уже ел или пил) — просто упомяни:")
+        for o in lost:
+            body = o["text"] if len(o["text"]) <= 3000 else o["text"][:3000] + " […]"
+            out.append(f"--- {o['created'][11:16]} {o['kind']}:\n{body}")
+        db.outbox_handed([o["id"] for o in lost])
     return "\n".join(out)
 
 
