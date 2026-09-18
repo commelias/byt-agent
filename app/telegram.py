@@ -27,8 +27,10 @@ def _split(text: str) -> list[str]:
     return parts or [""]
 
 
-async def send(text: str, chat_id: str | None = None) -> bool:
-    """Прислать сообщение. Длинный текст уходит несколькими частями по порядку."""
+async def send(text: str, chat_id: str | None = None, attempts: int = 1) -> bool:
+    """Прислать сообщение. Длинный текст уходит несколькими частями по порядку.
+    По умолчанию одна попытка: повторами занимается очередь, а долгие попытки внутри тика
+    при недоступном Telegram съедали минутные тики планировщика."""
     chat_id = chat_id or config.TELEGRAM_CHAT_ID
     if not config.TELEGRAM_BOT_TOKEN or not chat_id:
         log.warning("Telegram не настроен: нет TELEGRAM_BOT_TOKEN или TELEGRAM_CHAT_ID")
@@ -38,7 +40,7 @@ async def send(text: str, chat_id: str | None = None) -> bool:
     for i, part in enumerate(parts, 1):
         suffix = f"\n\n({i} из {len(parts)})" if len(parts) > 1 else ""
         if await http.post_json(url, {"chat_id": chat_id, "text": part + suffix},
-                                label="Telegram sendMessage") is None:
+                                attempts=attempts, label="Telegram sendMessage") is None:
             return False
     return True
 
