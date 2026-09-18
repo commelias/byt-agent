@@ -6,7 +6,7 @@
 import logging
 import sqlite3
 import threading
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from . import config
 
@@ -446,6 +446,20 @@ def outbox_retry(oid: int, attempts: int, next_try: str, error: str):
 
 def outbox_give_up(oid: int, attempts: int, error: str):
     _run("UPDATE outbox SET sent = 2, attempts = ?, error = ? WHERE id = ?", (attempts, error[:300], oid))
+
+
+def outbox_undelivered(hours: int = 12, limit: int = 5):
+    """Что сервис хотел прислать, но Telegram не пропустил (ждёт повтора или брошено).
+    Старше окна — не вытаскиваем: вчерашнее «поешь» уже ни к чему."""
+    since = (now_local() - timedelta(hours=hours)).isoformat(timespec="minutes")
+    return _all("""SELECT id, created, kind, text FROM outbox
+                   WHERE sent IN (0, 2) AND created >= ? ORDER BY id LIMIT ?""", (since, limit))
+
+
+def outbox_handed(ids: list[int]):
+    """Передано человеку через ответ агента: больше не шлём и не показываем (sent = 3)."""
+    for oid in ids:
+        _run("UPDATE outbox SET sent = 3, error = NULL WHERE id = ? AND sent IN (0, 2)", (oid,))
 
 
 def outbox_stuck(limit: int = 10):
