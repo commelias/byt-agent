@@ -18,7 +18,7 @@ from . import agent, config, db, orthodox, telegram
 
 log = logging.getLogger("byt.scheduler")
 
-MAX_ATTEMPTS = 5   # после этого сообщение помечается несостоявшимся и видно в /diag
+MAX_ATTEMPTS = 5   # после этого сообщение помечается несостоявшимся; Донна передаст его сама (context)
 BATCH = 6          # сколько сообщений отправляем за один тик
 
 MEAL_TEXT = ("Давно не было записей о еде. Всё в порядке? Если ел — напиши, что было, я запишу. "
@@ -234,6 +234,7 @@ async def flush(now: datetime):
         else:
             nxt = (now + timedelta(minutes=3 * attempts)).isoformat(timespec="minutes")
             db.outbox_retry(item["id"], attempts, nxt, "Telegram не принял сообщение")
+        break  # Telegram недоступен — остальных в этот тик не мучаем, тик не должен висеть
 
 
 async def tick():
